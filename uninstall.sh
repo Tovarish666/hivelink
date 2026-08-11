@@ -27,6 +27,15 @@ say "udev и sysctl"
 rm -f /etc/udev/rules.d/70-hivelink.rules
 rm -f /etc/sysctl.d/90-hivelink.conf
 rm -f /etc/systemd/network/10-hivelink-modems.network
+
+# Возвращаем штатное авто-переключение: удаляем нашу копию из /etc,
+# после чего снова начинает действовать файл из /lib.
+if [ -f /etc/udev/rules.d/40-usb_modeswitch.rules ] &&
+   grep -q '^# hivelink:' /etc/udev/rules.d/40-usb_modeswitch.rules 2>/dev/null; then
+    rm -f /etc/udev/rules.d/40-usb_modeswitch.rules
+    say "  штатное авто-переключение usb_modeswitch возвращено"
+fi
+
 udevadm control --reload 2>/dev/null || true
 
 say "снимаю адресацию модемов"

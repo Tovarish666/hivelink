@@ -85,6 +85,24 @@ cmd_doctor() {
     esac
     command -v dkms >/dev/null && dkms status 2>/dev/null | grep -i hivelink | sed 's/^/  /'
 
+    h "перехват авто-переключения usb_modeswitch"
+    local ours=/etc/udev/rules.d/40-usb_modeswitch.rules
+    local stock=/lib/udev/rules.d/40-usb_modeswitch.rules
+    if [ -f "$ours" ] && grep -q '^# hivelink:' "$ours" 2>/dev/null; then
+        printf "  %sOK%s   перехвачено, вендоры: %s\n" "$C_OK" "$C_OFF" \
+            "$(grep -oP '(?<=для вендоров )\S+' "$ours" | head -1)"
+        if [ -f "$stock" ] && [ "$stock" -nt "$ours" ]; then
+            printf "  %sВНИМАНИЕ%s штатный файл новее нашего — пакет обновился,\n" "$C_WARN" "$C_OFF"
+            printf "           перезапусти install.sh, чтобы пересобрать копию\n"
+        fi
+    elif [ -f "$stock" ]; then
+        printf "  %sНЕТ%s  штатное правило активно и будет драться с hivelink:\n" "$C_BAD" "$C_OFF"
+        printf "        оно запускает usb_modeswitch на каждом модеме без координации\n"
+        printf "        и уводит устройства в конфигурацию с MBIM. Запусти install.sh\n"
+    else
+        printf "  %sштатного правила нет — перехватывать нечего%s\n" "$C_DIM" "$C_OFF"
+    fi
+
     h "зависимости"
     local b
     for b in usb_modeswitch curl ip ping flock lsusb dkms; do

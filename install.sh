@@ -135,6 +135,49 @@ fi
 
 say "udev"
 install -m 644 "$SRC/etc/udev/70-hivelink.rules" /etc/udev/rules.d/70-hivelink.rules
+
+# Перехват штатного авто-переключения.
+#
+# /lib/udev/rules.d/40-usb_modeswitch.rules запускает usb_modeswitch на КАЖДОМ
+# устройстве вендора независимо и без координации. На двадцати модемах это
+# шторм, а его диспетчер при неудаче перебирает USB-конфигурации и уводит
+# устройство в конфигурацию с MBIM — там нужного endpoint нет вовсе,
+# и переключение становится невозможным. Наблюдалось вживую: конфигурация 1
+# держалась 0.7 секунды и сменялась на 2.
+#
+# Одноимённый файл в /etc полностью отменяет тот, что в /lib. Копируем
+# штатный, добавляя ранний выход для наших вендоров: hivelink переключает
+# сам — под блокировкой, со счётчиками попыток и с предустановкой
+# конфигурации 1. Для всех прочих устройств поведение остаётся штатным.
+STOCK_MS=/lib/udev/rules.d/40-usb_modeswitch.rules
+OUR_MS=/etc/udev/rules.d/40-usb_modeswitch.rules
+VENDORS="$(sed -n 's/^ *HL_VENDORS=["'"'"']\{0,1\}\([^"'"'"']*\).*/\1/p' "$ETC/hivelink.conf" 2>/dev/null | tail -1)"
+VENDORS="${VENDORS:-12d1}"
+
+if [ -f "$STOCK_MS" ]; then
+    {
+        printf '# hivelink: перехват штатного авто-переключения.\n'
+        printf '# Копия %s с ранним выходом\n' "$STOCK_MS"
+        printf '# для вендоров %s — ими управляет hivelink сам.\n' "$VENDORS"
+        printf '# Файл пересоздаётся при установке и удаляется uninstall.sh.\n#\n'
+        awk -v vendors="$VENDORS" '
+            BEGIN { n = split(vendors, v, " ") }
+            !ins && /^ACTION!=/ {
+                print
+                for (i = 1; i <= n; i++)
+                    printf "\n# hivelink переключает этого вендора сам\nATTRS{idVendor}==\"%s\", GOTO=\"modeswitch_rules_end\"\n", v[i]
+                ins = 1
+                next
+            }
+            { print }
+        ' "$STOCK_MS"
+    } >"$OUR_MS"
+    chmod 644 "$OUR_MS"
+    say "  штатное авто-переключение перехвачено для: $VENDORS"
+else
+    warn "  $STOCK_MS не найден — перехватывать нечего"
+fi
+
 udevadm control --reload 2>/dev/null || true
 
 say "systemd"
