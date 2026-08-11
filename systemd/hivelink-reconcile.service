@@ -1,0 +1,19 @@
+[Unit]
+Description=hivelink — цикл приведения USB-модемов в рабочее состояние
+Documentation=https://github.com/Tovarish666/hivelink
+After=network.target systemd-udev-settle.service
+Wants=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/hivelink/sbin/hivelink-reconcile
+# Цикл идемпотентен; неуспех одного модема не должен ронять юнит,
+# иначе systemd перестанет его запускать по таймеру.
+SuccessExitStatus=0 1
+TimeoutStartSec=300
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+[Install]
+WantedBy=multi-user.target

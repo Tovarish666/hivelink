@@ -1,0 +1,259 @@
+#!/bin/bash
+# hivelink — управление фермой USB-модемов.
+#
+#   hivelink status              таблица модемов
+#   hivelink doctor              полный дамп для диагностики
+#   hivelink info   <slot>       модель, прошивка, IMEI, сигнал
+#   hivelink up     <slot>       поднять соединение через веб-API
+#   hivelink down   <slot>       разорвать соединение
+#   hivelink reset  <slot|--all> сброс USB-устройства
+#   hivelink rescan              один цикл reconcile прямо сейчас
+#   hivelink recfg  <slot|--all> забыть выученное (кэш драйверов)
+#   hivelink slots               карта «USB-порт -> номер модема»
+#   hivelink speed  <slot>       быстрый замер полосы
+#   hivelink sms    <slot>       входящие SMS
+#   hivelink logs   [-f]         журнал
+
+set -uo pipefail
+
+HL_LIB="${HL_LIB:-/opt/hivelink/lib}"
+. "$HL_LIB/common.sh"
+. "$HL_LIB/usb.sh"
+. "$HL_LIB/net.sh"
+. "$HL_LIB/hilink.sh"
+. "$HL_LIB/health.sh"
+
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+
+C_OK=$'\033[32m'; C_BAD=$'\033[31m'; C_WARN=$'\033[33m'
+C_DIM=$'\033[90m'; C_HEAD=$'\033[1;36m'; C_OFF=$'\033[0m'
+
+need_root() { [ "$(id -u)" = 0 ] || die "нужен root"; }
+
+# --------------------------------------------------------------- status ----
+
+cmd_status() {
+    local snap="$HL_RUN/status.tsv"
+    if [ ! -f "$snap" ]; then
+        warn "снимка ещё нет — запусти: hivelink rescan"
+        return 1
+    fi
+
+    printf "%s%-6s %-12s %-9s %-7s %-8s %s%s\n" "$C_HEAD" \
+        СЛОТ ПОРТ ИНТЕРФЕЙС СТАТУС ОШ.ПРИЁМ ПОДРОБНОСТИ "$C_OFF"
+
+    local slot port iface st detail col ratio
+    while IFS=$'\t' read -r slot port iface st detail; do
+        [ -n "$slot" ] || continue
+        case "$st" in
+            ok)   col="$C_OK" ;;
+            fail) col="$C_BAD" ;;
+            *)    col="$C_WARN" ;;
+        esac
+        ratio="-"
+        [ "$iface" != "-" ] && [ -e "/sys/class/net/$iface" ] &&
+            ratio="$(hl_rx_error_ratio "$iface")%"
+        printf "%-6s %-12s %-9s ${col}%-7s${C_OFF} %-8s %s%s%s\n" \
+            "$slot" "$port" "$iface" "$st" "$ratio" "$C_DIM" "$detail" "$C_OFF"
+    done <"$snap"
+
+    local last age
+    last=$(cat "$HL_RUN/last-run" 2>/dev/null || echo 0)
+    age=$(( $(date +%s) - last ))
+    printf "\n%sпоследний цикл: %sс назад%s\n" "$C_DIM" "$age" "$C_OFF"
+}
+
+# --------------------------------------------------------------- doctor ----
+
+h() { printf "\n%s==== %s ====%s\n" "$C_HEAD" "$*" "$C_OFF"; }
+
+cmd_doctor() {
+    h "версия и конфиг"
+    cat /opt/hivelink/VERSION 2>/dev/null
+    printf "конфиг: %s\n" "$HL_CONF"
+    grep -vE '^\s*#|^\s*$' "$HL_CONF" 2>/dev/null | sed 's/^/  /'
+
+    h "фикс rndis_host"
+    local f p
+    f=$(modinfo rndis_host 2>/dev/null | awk '/^filename/{print $2}')
+    p=$(cat /sys/module/rndis_host/parameters/rx_urb_size_override 2>/dev/null || echo "нет параметра")
+    printf "  модуль:   %s\n" "${f:-не загружен}"
+    printf "  параметр: %s\n" "$p"
+    case "$f" in
+        */updates/*) printf "  %sOK — активен наш модуль%s\n" "$C_OK" "$C_OFF" ;;
+        *)           printf "  %sВНИМАНИЕ — загружен штатный модуль, приём будет ~1 Мбит%s\n" "$C_BAD" "$C_OFF" ;;
+    esac
+    command -v dkms >/dev/null && dkms status 2>/dev/null | grep -i hivelink | sed 's/^/  /'
+
+    h "зависимости"
+    local b
+    for b in usb_modeswitch curl ip ping flock lsusb dkms; do
+        if command -v "$b" >/dev/null 2>&1; then
+            printf "  %sOK%s   %s\n" "$C_OK" "$C_OFF" "$b"
+        else
+            printf "  %sНЕТ%s  %s\n" "$C_BAD" "$C_OFF" "$b"
+        fi
+    done
+
+    h "USB-устройства"
+    lsusb 2>/dev/null | grep -iE "$(printf '%s' "$HL_VENDORS" | tr ' ' '|')" | sed 's/^/  /'
+    printf "\n  дерево (скорости портов):\n"
+    lsusb -t 2>/dev/null | sed 's/^/  /'
+
+    h "карта слотов"
+    cmd_slots
+
+    h "интерфейсы и драйверы"
+    local d i
+    for d in /sys/class/net/*/device/driver; do
+        [ -e "$d" ] || continue
+        i=$(echo "$d" | cut -d/ -f5)
+        printf "  %-10s %-12s %s\n" "$i" \
+            "$(basename "$(readlink -f "$d")")" \
+            "$(cat "/sys/class/net/$i/address" 2>/dev/null)"
+    done
+
+    h "счётчики приёма"
+    for i in /sys/class/net/"$HL_IFACE_PREFIX"*; do
+        [ -d "$i" ] || continue
+        i=$(basename "$i")
+        printf "  %-10s rx_packets=%-10s rx_errors=%-8s (%s%%)\n" "$i" \
+            "$(cat "/sys/class/net/$i/statistics/rx_packets" 2>/dev/null)" \
+            "$(cat "/sys/class/net/$i/statistics/rx_errors"  2>/dev/null)" \
+            "$(hl_rx_error_ratio "$i")"
+    done
+
+    h "маршрутизация"
+    ip rule list 2>/dev/null | grep -E "$HL_TABLE_BASE|lookup 1[0-9]{4}" | sed 's/^/  /'
+
+    h "резолвер"
+    if hl_dns_hijacked; then
+        printf "  %sУГНАН модемом%s\n" "$C_BAD" "$C_OFF"
+    else
+        printf "  %sчистый%s\n" "$C_OK" "$C_OFF"
+    fi
+    grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | sed 's/^/  /'
+
+    h "sysctl"
+    sysctl net.ipv4.conf.all.rp_filter net.ipv4.conf.all.arp_ignore \
+           net.ipv4.conf.all.arp_announce net.ipv4.ip_forward 2>/dev/null | sed 's/^/  /'
+
+    h "юниты"
+    systemctl status hivelink-reconcile.timer --no-pager 2>/dev/null | head -6 | sed 's/^/  /'
+
+    h "последние ошибки в журнале"
+    journalctl -t hivelink -p warning -n 20 --no-pager 2>/dev/null | sed 's/^/  /'
+}
+
+# ---------------------------------------------------------------- прочее ---
+
+cmd_slots() {
+    printf "%s%-14s %-6s %-9s %s%s\n" "$C_HEAD" USB-ПОРТ СЛОТ ИНТЕРФЕЙС АДРЕС "$C_OFF"
+    local port slot
+    while read -r port slot; do
+        [ -n "$port" ] || continue
+        printf "%-14s %-6s %-9s %s\n" "$port" "$slot" "$(hl_iface "$slot")" "$(hl_host "$slot")"
+    done < <(sort -k2 -n "$HL_SLOTS" 2>/dev/null)
+}
+
+cmd_info() {
+    local slot="${1:?нужен номер слота}" x
+    x=$(hl_hilink_ident "$slot") || die "слот $slot: API не отвечает"
+    read -r model fw imei wan <<<"$x"
+    printf "  модель:   %s\n  прошивка: %s\n  IMEI:     %s\n  WAN IP:   %s\n" \
+        "$model" "$fw" "$imei" "$wan"
+    printf "  статус:   %s\n" "$(hl_hilink_conn_status "$slot")"
+    local s; s=$(hl_hilink_signal "$slot" 2>/dev/null) &&
+        printf "  сигнал:   %s\n" "$s"
+}
+
+cmd_up()    { need_root; hl_hilink_dataswitch_on "${1:?нужен слот}"; hl_hilink_ensure_connected "$1"; }
+cmd_down()  { need_root; hl_api_post "${1:?нужен слот}" dialup/mobile-dataswitch \
+                '<?xml version="1.0" encoding="UTF-8"?><request><dataswitch>0</dataswitch></request>' >/dev/null &&
+              info "слот $1: передача данных выключена"; }
+
+cmd_reset() {
+    need_root
+    local a="${1:?нужен слот или --all}" port
+    if [ "$a" = "--all" ]; then
+        while read -r port _; do [ -n "$port" ] && hl_usb_reset "$port"; done <"$HL_SLOTS"
+    else
+        port=$(hl_port_for_slot "$a") || die "слот $a не найден"
+        hl_usb_reset "$port"
+    fi
+}
+
+cmd_recfg() {
+    need_root
+    local a="${1:---all}"
+    if [ "$a" = "--all" ]; then
+        : >"$HL_CONFMAP"; info "кэш драйверов очищен полностью"
+    else
+        local port pid bcd
+        port=$(hl_port_for_slot "$a") || die "слот $a не найден"
+        pid=$(hl_dev_attr "$port" idProduct); bcd=$(hl_dev_attr "$port" bcdDevice)
+        local tmp="$HL_CONFMAP.$$"
+        awk -v k="$pid:$bcd" '$1!=k' "$HL_CONFMAP" >"$tmp" && mv -f "$tmp" "$HL_CONFMAP"
+        info "слот $a: выученное для $pid:$bcd сброшено"
+    fi
+    rm -f "$HL_VAR"/fails.*
+}
+
+cmd_rescan() { need_root; /opt/hivelink/sbin/hivelink-reconcile "$@"; }
+
+cmd_speed() {
+    local slot="${1:?нужен слот}" host b0 e0 b1 e1 t=10
+    host=$(hl_host "$slot")
+    command -v curl >/dev/null || die "нужен curl"
+    local iface; iface=$(hl_iface "$slot")
+
+    b0=$(cat "/sys/class/net/$iface/statistics/rx_bytes"  2>/dev/null || echo 0)
+    e0=$(cat "/sys/class/net/$iface/statistics/rx_errors" 2>/dev/null || echo 0)
+    printf "замер %sс через %s (%s)...\n" "$t" "$iface" "$host"
+    timeout "$t" curl -s --interface "$host" -o /dev/null \
+        "https://speed.cloudflare.com/__down?bytes=500000000" 2>/dev/null
+    b1=$(cat "/sys/class/net/$iface/statistics/rx_bytes"  2>/dev/null || echo 0)
+    e1=$(cat "/sys/class/net/$iface/statistics/rx_errors" 2>/dev/null || echo 0)
+
+    local mbit; mbit=$(( (b1 - b0) * 8 / t / 1000000 ))
+    printf "  скорость:      ~%s Мбит/с\n" "$mbit"
+    printf "  ошибок приёма: +%s\n" "$((e1 - e0))"
+    [ "$((e1 - e0))" -gt 100 ] &&
+        printf "  %sмного ошибок — проверь фикс: hivelink doctor%s\n" "$C_WARN" "$C_OFF"
+    return 0
+}
+
+cmd_sms() {
+    local slot="${1:?нужен слот}" x
+    x=$(hl_hilink_sms_list "$slot") || die "слот $slot: API не отвечает"
+    printf '%s\n' "$x" | sed 's#</Message>#&\n#g' | while read -r line; do
+        case "$line" in
+            *"<Phone>"*)
+                printf "%s%s%s  %s\n  %s\n\n" "$C_HEAD" \
+                    "$(hl_xml "$line" Phone)" "$C_OFF" \
+                    "$(hl_xml "$line" Date)" \
+                    "$(hl_xml "$line" Content)" ;;
+        esac
+    done
+}
+
+cmd_logs() { journalctl -t hivelink --no-pager "$@"; }
+
+# ------------------------------------------------------------------ main ---
+
+case "${1:-}" in
+    status)  shift; cmd_status  "$@" ;;
+    doctor)  shift; cmd_doctor  "$@" ;;
+    slots)   shift; cmd_slots   "$@" ;;
+    info)    shift; cmd_info    "$@" ;;
+    up)      shift; cmd_up      "$@" ;;
+    down)    shift; cmd_down    "$@" ;;
+    reset)   shift; cmd_reset   "$@" ;;
+    recfg)   shift; cmd_recfg   "$@" ;;
+    rescan)  shift; cmd_rescan  "$@" ;;
+    speed)   shift; cmd_speed   "$@" ;;
+    sms)     shift; cmd_sms     "$@" ;;
+    logs)    shift; cmd_logs    "$@" ;;
+    ""|-h|--help) usage ;;
+    *)       err "неизвестная команда: $1"; usage; exit 2 ;;
+esac

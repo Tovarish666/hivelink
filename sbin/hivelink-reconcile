@@ -1,0 +1,137 @@
+#!/bin/bash
+# hivelink-reconcile — один полный цикл приведения модемов в рабочее состояние.
+#
+# Идемпотентен: гоняется по таймеру и по udev-событию, ничего не ломает
+# повторным запуском. Всё, что не удалось, попадает в лог и в снимок статуса.
+#
+#   hivelink-reconcile [--slot N] [--verbose] [--no-recover]
+
+set -uo pipefail
+
+HL_LIB="${HL_LIB:-/opt/hivelink/lib}"
+. "$HL_LIB/common.sh"
+. "$HL_LIB/usb.sh"
+. "$HL_LIB/net.sh"
+. "$HL_LIB/hilink.sh"
+. "$HL_LIB/health.sh"
+
+ONLY_SLOT=""
+DO_RECOVER=1
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --slot)        ONLY_SLOT="$2"; shift 2 ;;
+        --verbose|-v)  HL_LOG_LEVEL=debug; _HL_LVL=10; HL_LOG_STDERR=1; shift ;;
+        --no-recover)  DO_RECOVER=0; shift ;;
+        -h|--help)     sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)             err "неизвестный аргумент: $1"; exit 2 ;;
+    esac
+done
+
+[ "$(id -u)" = 0 ] || die "нужен root"
+
+hl_state_init
+hl_lock reconcile 60
+
+SNAP="$HL_RUN/status.tsv"
+: >"$SNAP.tmp"
+
+# ------------------------------------------------------- общесистемное -----
+
+hl_sysctl_apply
+hl_dns_guard || true
+
+# --------------------------------------------------------- обход устройств --
+
+seen=0
+ok=0
+bad=0
+
+while read -r port vid pid bcd; do
+    [ -n "$port" ] || continue
+    seen=$((seen + 1))
+
+    # ---- слот: вечная привязка к физическому порту
+    slot=$(hl_slot_for_port "$port") || continue
+    if [ -n "$ONLY_SLOT" ] && [ "$slot" != "$ONLY_SLOT" ]; then continue; fi
+
+    iface_want=$(hl_iface "$slot")
+    dbg "порт $port -> слот $slot ($vid:$pid rev $bcd)"
+
+    hl_disable_autosuspend "$port"
+
+    # ---- стадия 1: Zero-CD
+    if hl_is_zerocd "$pid"; then
+        if ! hl_modeswitch "$port" "$vid" "$pid"; then
+            printf '%s\t%s\t%s\t%s\t%s\n' "$slot" "$port" "-" "zerocd" "не переключился" >>"$SNAP.tmp"
+            bad=$((bad + 1)); continue
+        fi
+        pid=$(hl_dev_attr "$port" idProduct)
+    fi
+
+    # ---- стадия 2: драйвер
+    read -r family want_drv <<<"$(hl_registry_lookup "$vid" "$pid")"
+    [ "$HL_PREFER_DRIVER" != auto ] && want_drv="$HL_PREFER_DRIVER"
+    hl_confmap_set "$pid:$bcd" "$want_drv"
+
+    have_drv=$(hl_driver_of_port "$port" 2>/dev/null || echo "")
+    if [ -z "$have_drv" ]; then
+        warn "$port: сетевого интерфейса нет (драйвер не привязался), пробую rebind"
+        hl_rebind "$port"
+        have_drv=$(hl_driver_of_port "$port" 2>/dev/null || echo "")
+    fi
+    if [ -z "$have_drv" ]; then
+        printf '%s\t%s\t%s\t%s\t%s\n' "$slot" "$port" "-" "nodrv" "нет драйвера ($vid:$pid)" >>"$SNAP.tmp"
+        bad=$((bad + 1)); continue
+    fi
+    [ "$have_drv" = "$want_drv" ] ||
+        dbg "$port: драйвер $have_drv (в реестре $want_drv для семейства $family)"
+
+    # ---- стадия 3: имя интерфейса
+    iface=$(hl_netdev_of_port "$port") || {
+        printf '%s\t%s\t%s\t%s\t%s\n' "$slot" "$port" "-" "noif" "интерфейс не найден" >>"$SNAP.tmp"
+        bad=$((bad + 1)); continue
+    }
+    if [ "$iface" != "$iface_want" ]; then
+        hl_rename_netdev "$iface" "$iface_want" && iface="$iface_want"
+    fi
+
+    # ---- стадия 4: адресация и маршруты
+    if ! hl_addr_configure "$slot" "$iface"; then
+        printf '%s\t%s\t%s\t%s\t%s\n' "$slot" "$port" "$iface" "noaddr" "адресация не встала" >>"$SNAP.tmp"
+        bad=$((bad + 1)); continue
+    fi
+
+    # ---- стадия 5: соединение через веб-API
+    if [ "$family" = hilink ]; then
+        hl_hilink_ensure_connected "$slot" || true
+    fi
+
+    # ---- стадия 6: здоровье и восстановление
+    hl_check_driver_fix "$iface" || true
+    reason=$(hl_health_reason "$slot" "$iface")
+    if [ -z "$reason" ]; then
+        hl_fail_clear "$slot"
+        ok=$((ok + 1))
+        printf '%s\t%s\t%s\t%s\t%s\n' "$slot" "$port" "$iface" "ok" "$have_drv" >>"$SNAP.tmp"
+    else
+        n=$(hl_fail_bump "$slot")
+        warn "слот $slot ($iface): $reason [неудача $n]"
+        [ "$DO_RECOVER" = 1 ] && [ "$HL_WATCHDOG_ENABLE" = 1 ] &&
+            hl_recover "$slot" "$iface" "$port" "$n"
+        bad=$((bad + 1))
+        printf '%s\t%s\t%s\t%s\t%s\n' "$slot" "$port" "$iface" "fail" "$reason" >>"$SNAP.tmp"
+    fi
+
+done <<<"$(hl_usb_devices)"
+
+sort -n "$SNAP.tmp" >"$SNAP" 2>/dev/null && rm -f "$SNAP.tmp"
+date +%s >"$HL_RUN/last-run"
+
+if [ "$seen" = 0 ]; then
+    warn "модемов не найдено (искал вендоров: $HL_VENDORS)"
+else
+    info "цикл завершён: найдено $seen, в норме $ok, с проблемами $bad"
+fi
+
+exit 0

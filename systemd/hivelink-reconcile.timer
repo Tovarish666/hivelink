@@ -1,0 +1,14 @@
+[Unit]
+Description=hivelink — периодическая сверка состояния модемов
+Documentation=https://github.com/Tovarish666/hivelink
+
+[Timer]
+# Первый прогон вскоре после загрузки, дальше каждые полминуты.
+# Цикл дешёвый: пока всё в норме, он только читает sysfs и пингует шлюзы.
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Unit=hivelink-reconcile.service
+
+[Install]
+WantedBy=timers.target

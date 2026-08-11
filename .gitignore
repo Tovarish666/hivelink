@@ -1,0 +1,10 @@
+*.pyc
+__pycache__/
+*.ko
+*.o
+*.mod
+*.mod.c
+.tmp_versions/
+Module.symvers
+modules.order
+*.tar.xz
