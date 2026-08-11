@@ -192,8 +192,9 @@ cmd_recfg() {
         local port pid bcd
         port=$(hl_port_for_slot "$a") || die "слот $a не найден"
         pid=$(hl_dev_attr "$port" idProduct); bcd=$(hl_dev_attr "$port" bcdDevice)
-        local tmp="$HL_CONFMAP.$$"
+        local tmp; tmp=$(mktemp "$HL_CONFMAP.XXXXXX")
         awk -v k="$pid:$bcd" '$1!=k' "$HL_CONFMAP" >"$tmp" && mv -f "$tmp" "$HL_CONFMAP"
+        rm -f "$tmp" 2>/dev/null
         info "слот $a: выученное для $pid:$bcd сброшено"
     fi
     rm -f "$HL_VAR"/fails.*

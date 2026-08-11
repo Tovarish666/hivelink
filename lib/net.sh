@@ -60,8 +60,13 @@ hl_addr_configure() {
         || { err "$iface: не задать default в таблице $table"; return 1; }
     ip route replace "$net.0/24" dev "$iface" src "$host" table "$table" 2>/dev/null
 
-    ip rule list 2>/dev/null | grep -q "from $host lookup $table" \
-        || ip rule add from "$host" lookup "$table" pref "$((HL_TABLE_BASE + slot))" 2>/dev/null
+    if [ -n "${HL_RULES_SNAPSHOT:-}" ]; then
+        hl_rule_exists "$host" "$table" \
+            || ip rule add from "$host" lookup "$table" pref "$((HL_TABLE_BASE + slot))" 2>/dev/null
+    else
+        ip rule list 2>/dev/null | grep -q "from $host lookup $table" \
+            || ip rule add from "$host" lookup "$table" pref "$((HL_TABLE_BASE + slot))" 2>/dev/null
+    fi
 
     # Локальный маршрут в подсети модема, чтобы веб-морда была достижима
     ip route replace "$net.0/24" dev "$iface" src "$host" 2>/dev/null
@@ -70,11 +75,64 @@ hl_addr_configure() {
 }
 
 hl_addr_teardown() {
-    local slot="$1" iface="$2" host table
+    local slot="$1" iface="${2:-}" host table
     host=$(hl_host "$slot"); table=$(hl_table "$slot")
     ip rule del from "$host" lookup "$table" 2>/dev/null || true
     ip route flush table "$table" 2>/dev/null || true
     [ -n "$iface" ] && ip -4 addr flush dev "$iface" 2>/dev/null || true
+    return 0
+}
+
+# ------------------------------------------------------- сборка мусора -----
+#
+# Номер модема может смениться: переткнули в другое гнездо, поставили пин,
+# потеряли карту слотов. Старое правило "from 192.168.101.100 lookup 10101"
+# при этом остаётся жить и рано или поздно перехватит трафик чужого модема.
+# Поэтому каждый цикл сверяем: всё, что в нашем диапазоне таблиц, но не
+# принадлежит ни одному активному слоту — сносим.
+#
+#   hl_gc_orphans "<активные слоты через пробел>"
+
+hl_gc_orphans() {
+    [ "${HL_GC:-1}" = 1 ] || return 0
+    local active=" $1 " pref slot n=0
+
+    # 1) правила с приоритетом из нашего диапазона
+    while read -r pref; do
+        [ -n "$pref" ] || continue
+        slot=$((pref - HL_TABLE_BASE))
+        [ "$slot" -ge "$HL_SLOT_MIN" ] 2>/dev/null || continue
+        [ "$slot" -le "$HL_SLOT_MAX" ] 2>/dev/null || continue
+        case "$active" in *" $slot "*) continue ;; esac
+        warn "сборка мусора: слот $slot больше не занят — снимаю правило и таблицу"
+        hl_addr_teardown "$slot"
+        n=$((n + 1))
+    done < <(ip rule list 2>/dev/null | sed -n 's/^\([0-9]\+\):.*lookup.*/\1/p' | sort -u)
+
+    # 2) слоты, явно помеченные при перекрытии пином
+    if [ -f "$HL_RUN/stale-slots" ]; then
+        while read -r slot; do
+            [ -n "$slot" ] || continue
+            case "$active" in *" $slot "*) continue ;; esac
+            hl_addr_teardown "$slot"
+            n=$((n + 1))
+        done <"$HL_RUN/stale-slots"
+        rm -f "$HL_RUN/stale-slots"
+    fi
+
+    [ "$n" -gt 0 ] && info "сборка мусора: снято $n осиротевших слотов"
+    return 0
+}
+
+# Снимок правил один раз за цикл: при 200 модемах вызывать "ip rule list"
+# на каждый модем — это 200 запусков процесса на ровном месте.
+hl_rules_cache() { HL_RULES_SNAPSHOT=$(ip rule list 2>/dev/null); }
+
+hl_rule_exists() {
+    case "${HL_RULES_SNAPSHOT:-}" in
+        *"from $1 lookup $2"*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # --------------------------------------------------------- защита DNS ------

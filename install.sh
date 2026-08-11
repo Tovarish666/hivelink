@@ -35,21 +35,49 @@ die()  { printf '\033[31m!!\033[0m %s\n' "$*" >&2; exit 1; }
 # ------------------------------------------------------------ зависимости --
 
 say "зависимости"
-MISSING=""
-for b in curl ip ping flock lsusb; do
-    command -v "$b" >/dev/null 2>&1 || MISSING="$MISSING $b"
-done
-command -v usb_modeswitch >/dev/null 2>&1 || MISSING="$MISSING usb_modeswitch"
 
-if [ -n "$MISSING" ]; then
-    warn "не хватает:$MISSING — ставлю"
-    apt-get update -qq || true
-    apt-get install -y usb-modeswitch usb-modeswitch-data curl iproute2 \
-                       iputils-ping util-linux usbutils 2>&1 | tail -3 \
-        || die "apt не отработал. Если это битые зависимости — сначала: apt --fix-broken install"
+# Битые зависимости блокируют вообще любую установку. Именно на этом
+# в прошлый раз молча не встал usb_modeswitch, а вместе с ним отвалилась
+# целая стадия. Поэтому чиним ДО всего остального.
+if ! apt-get check >/dev/null 2>&1; then
+    warn "в apt битые зависимости — чиню"
+    apt-get --fix-broken install -y 2>&1 | tail -5 \
+        || die "apt --fix-broken install не справился, разберись руками"
 fi
-command -v usb_modeswitch >/dev/null 2>&1 \
-    || die "usb_modeswitch так и не появился. Без него модемы не выйдут из Zero-CD."
+
+PKGS="usb-modeswitch usb-modeswitch-data curl iproute2 iputils-ping
+      util-linux usbutils dkms build-essential python3 wget"
+
+NEED=""
+for p in $PKGS; do
+    dpkg -s "$p" >/dev/null 2>&1 || NEED="$NEED $p"
+done
+
+if [ -n "$NEED" ]; then
+    say "ставлю:$NEED"
+    apt-get update -qq 2>/dev/null || warn "apt update не отработал, пробую из кэша"
+    # shellcheck disable=SC2086
+    apt-get install -y $NEED 2>&1 | tail -5 || die "apt не поставил:$NEED"
+fi
+
+# Заголовки ядра — имя пакета разное на PVE 9.x, PVE 8.x и чистом Debian
+KREL="$(uname -r)"
+if [ ! -d "/lib/modules/$KREL/build" ]; then
+    say "заголовки ядра для $KREL"
+    for p in "proxmox-headers-$KREL" "pve-headers-$KREL" "linux-headers-$KREL"; do
+        apt-get install -y "$p" >/dev/null 2>&1 && { say "  поставлен $p"; break; }
+    done
+fi
+[ -d "/lib/modules/$KREL/build" ] \
+    || warn "заголовков нет — фикс скорости не соберётся, остальное будет работать"
+
+# Проверяем результат, а не факт запуска apt
+FAIL=""
+for b in curl ip ping flock lsusb usb_modeswitch python3; do
+    command -v "$b" >/dev/null 2>&1 || FAIL="$FAIL $b"
+done
+[ -n "$FAIL" ] && die "не появились обязательные утилиты:$FAIL"
+say "все зависимости на месте"
 
 # ---------------------------------------------------------------- файлы ----
 

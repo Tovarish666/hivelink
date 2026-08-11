@@ -4,7 +4,12 @@
 # Идемпотентен: гоняется по таймеру и по udev-событию, ничего не ломает
 # повторным запуском. Всё, что не удалось, попадает в лог и в снимок статуса.
 #
-#   hivelink-reconcile [--slot N] [--verbose] [--no-recover]
+# Устроен в три фазы, потому что модемов может быть под три сотни:
+#   1. последовательно и быстро — раздача номеров (пишет общий файл)
+#   2. параллельно            — стадии по каждому модему (тут все таймауты)
+#   3. последовательно        — сборка результатов и уборка мусора
+#
+#   hivelink-reconcile [--slot N] [--verbose] [--no-recover] [--full]
 
 set -uo pipefail
 
@@ -17,13 +22,15 @@ HL_LIB="${HL_LIB:-/opt/hivelink/lib}"
 
 ONLY_SLOT=""
 DO_RECOVER=1
+FORCE_HEALTH=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --slot)        ONLY_SLOT="$2"; shift 2 ;;
-        --verbose|-v)  HL_LOG_LEVEL=debug; _HL_LVL=10; HL_LOG_STDERR=1; shift ;;
+        --verbose|-v)  HL_LOG_LEVEL=debug; _HL_LVL=10; _HL_ERR=1; shift ;;
         --no-recover)  DO_RECOVER=0; shift ;;
-        -h|--help)     sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --full)        FORCE_HEALTH=1; shift ;;
+        -h|--help)     sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)             err "неизвестный аргумент: $1"; exit 2 ;;
     esac
 done
@@ -33,105 +40,145 @@ done
 hl_state_init
 hl_lock reconcile 60
 
+WORKDIR="$HL_RUN/w"
+rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"
 SNAP="$HL_RUN/status.tsv"
-: >"$SNAP.tmp"
-
-# ------------------------------------------------------- общесистемное -----
+NOW=$(date +%s)
 
 hl_sysctl_apply
 hl_dns_guard || true
+hl_rules_cache
 
-# --------------------------------------------------------- обход устройств --
+# ============================================================ фаза 1 ========
+# Раздача номеров идёт строго последовательно: она пишет общую карту слотов,
+# и параллельный доступ к ней породил бы двух модемов с одним адресом.
 
-seen=0
-ok=0
-bad=0
-
+DEVS=()
 while read -r port vid pid bcd; do
     [ -n "$port" ] || continue
-    seen=$((seen + 1))
-
-    # ---- слот: вечная привязка к физическому порту
     slot=$(hl_slot_for_port "$port") || continue
-    if [ -n "$ONLY_SLOT" ] && [ "$slot" != "$ONLY_SLOT" ]; then continue; fi
+    [ -n "$ONLY_SLOT" ] && [ "$slot" != "$ONLY_SLOT" ] && continue
+    DEVS+=("$port|$vid|$pid|$bcd|$slot")
+done <<<"$(hl_usb_devices)"
 
+TOTAL=${#DEVS[@]}
+if [ "$TOTAL" = 0 ]; then
+    warn "модемов не найдено (искал вендоров: $HL_VENDORS)"
+    : >"$SNAP"; date +%s >"$HL_RUN/last-run"
+    exit 0
+fi
+
+# ============================================================ фаза 2 ========
+# Стадии по каждому модему. Здесь живут все дорогие операции: sleep после
+# modeswitch, пинги, запросы к веб-API. Отсюда и параллельность.
+
+worker() {
+    local spec="$1"
+    local port vid pid bcd slot
+    IFS='|' read -r port vid pid bcd slot <<<"$spec"
+
+    local iface_want out="$WORKDIR/$slot"
     iface_want=$(hl_iface "$slot")
-    dbg "порт $port -> слот $slot ($vid:$pid rev $bcd)"
+    report() { printf '%s\t%s\t%s\t%s\t%s\n' "$slot" "$port" "${3:--}" "$1" "$2" >"$out"; }
 
     hl_disable_autosuspend "$port"
 
     # ---- стадия 1: Zero-CD
     if hl_is_zerocd "$pid"; then
-        if ! hl_modeswitch "$port" "$vid" "$pid"; then
-            printf '%s\t%s\t%s\t%s\t%s\n' "$slot" "$port" "-" "zerocd" "не переключился" >>"$SNAP.tmp"
-            bad=$((bad + 1)); continue
-        fi
+        hl_modeswitch "$port" "$vid" "$pid" || { report zerocd "не переключился"; return; }
         pid=$(hl_dev_attr "$port" idProduct)
     fi
 
     # ---- стадия 2: драйвер
+    local family want_drv have_drv
     read -r family want_drv <<<"$(hl_registry_lookup "$vid" "$pid")"
     [ "$HL_PREFER_DRIVER" != auto ] && want_drv="$HL_PREFER_DRIVER"
     hl_confmap_set "$pid:$bcd" "$want_drv"
 
     have_drv=$(hl_driver_of_port "$port" 2>/dev/null || echo "")
     if [ -z "$have_drv" ]; then
-        warn "$port: сетевого интерфейса нет (драйвер не привязался), пробую rebind"
+        warn "$port: сетевого интерфейса нет, пробую rebind"
         hl_rebind "$port"
         have_drv=$(hl_driver_of_port "$port" 2>/dev/null || echo "")
     fi
-    if [ -z "$have_drv" ]; then
-        printf '%s\t%s\t%s\t%s\t%s\n' "$slot" "$port" "-" "nodrv" "нет драйвера ($vid:$pid)" >>"$SNAP.tmp"
-        bad=$((bad + 1)); continue
-    fi
-    [ "$have_drv" = "$want_drv" ] ||
-        dbg "$port: драйвер $have_drv (в реестре $want_drv для семейства $family)"
+    [ -z "$have_drv" ] && { report nodrv "нет драйвера ($vid:$pid)"; return; }
 
     # ---- стадия 3: имя интерфейса
-    iface=$(hl_netdev_of_port "$port") || {
-        printf '%s\t%s\t%s\t%s\t%s\n' "$slot" "$port" "-" "noif" "интерфейс не найден" >>"$SNAP.tmp"
-        bad=$((bad + 1)); continue
-    }
+    local iface
+    iface=$(hl_netdev_of_port "$port") || { report noif "интерфейс не найден"; return; }
     if [ "$iface" != "$iface_want" ]; then
         hl_rename_netdev "$iface" "$iface_want" && iface="$iface_want"
     fi
 
     # ---- стадия 4: адресация и маршруты
-    if ! hl_addr_configure "$slot" "$iface"; then
-        printf '%s\t%s\t%s\t%s\t%s\n' "$slot" "$port" "$iface" "noaddr" "адресация не встала" >>"$SNAP.tmp"
-        bad=$((bad + 1)); continue
-    fi
+    hl_addr_configure "$slot" "$iface" || { report noaddr "адресация не встала" "$iface"; return; }
 
     # ---- стадия 5: соединение через веб-API
-    if [ "$family" = hilink ]; then
-        hl_hilink_ensure_connected "$slot" || true
+    [ "$family" = hilink ] && hl_hilink_ensure_connected "$slot" >/dev/null 2>&1
+
+    # ---- стадия 6: здоровье
+    # Проверки стоят секунд, поэтому по расписанию, а не каждый цикл.
+    # Исключения: модем уже в неудачах, либо запрошен --full.
+    local hc_file="$HL_VAR/hc.$slot" hs_file="$HL_VAR/hs.$slot"
+    local last fails due reason
+    last=$(cat "$hc_file" 2>/dev/null || echo 0)
+    fails=$(hl_fail_count "$slot")
+    due=0
+    [ "$FORCE_HEALTH" = 1 ] && due=1
+    [ "$fails" -gt 0 ] 2>/dev/null && due=1
+    [ $((NOW - last)) -ge "$HL_HEALTH_INTERVAL" ] 2>/dev/null && due=1
+
+    if [ "$due" != 1 ]; then
+        reason=$(cat "$hs_file" 2>/dev/null || echo "")
+        if [ -z "$reason" ]; then report ok "$have_drv" "$iface"
+        else report fail "$reason (кэш)" "$iface"; fi
+        return
     fi
 
-    # ---- стадия 6: здоровье и восстановление
-    hl_check_driver_fix "$iface" || true
+    hl_check_driver_fix "$iface" >/dev/null 2>&1
     reason=$(hl_health_reason "$slot" "$iface")
+    echo "$NOW" >"$hc_file"
+
     if [ -z "$reason" ]; then
-        hl_fail_clear "$slot"
-        ok=$((ok + 1))
-        printf '%s\t%s\t%s\t%s\t%s\n' "$slot" "$port" "$iface" "ok" "$have_drv" >>"$SNAP.tmp"
+        hl_fail_clear "$slot"; : >"$hs_file"
+        report ok "$have_drv" "$iface"
     else
-        n=$(hl_fail_bump "$slot")
+        local n; n=$(hl_fail_bump "$slot")
+        printf '%s\n' "$reason" >"$hs_file"
         warn "слот $slot ($iface): $reason [неудача $n]"
         [ "$DO_RECOVER" = 1 ] && [ "$HL_WATCHDOG_ENABLE" = 1 ] &&
             hl_recover "$slot" "$iface" "$port" "$n"
-        bad=$((bad + 1))
-        printf '%s\t%s\t%s\t%s\t%s\n' "$slot" "$port" "$iface" "fail" "$reason" >>"$SNAP.tmp"
+        report fail "$reason" "$iface"
     fi
+}
 
-done <<<"$(hl_usb_devices)"
+PAR=$(hl_parallelism)
+dbg "обрабатываю $TOTAL модемов в $PAR потоков"
 
-sort -n "$SNAP.tmp" >"$SNAP" 2>/dev/null && rm -f "$SNAP.tmp"
+running=0
+for spec in "${DEVS[@]}"; do
+    worker "$spec" &
+    running=$((running + 1))
+    if [ "$running" -ge "$PAR" ]; then
+        if wait -n 2>/dev/null; then :; else wait; running=0; continue; fi
+        running=$((running - 1))
+    fi
+done
+wait
+
+# ============================================================ фаза 3 ========
+
+cat "$WORKDIR"/* 2>/dev/null | sort -n >"$SNAP"
+rm -rf "$WORKDIR"
+
+ok=$(awk -F'\t' '$4=="ok"' "$SNAP" 2>/dev/null | wc -l)
+bad=$((TOTAL - ok))
+
+# Осиротевшие правила и таблицы: модем переткнули, номер сменился,
+# а старое правило осталось бы перехватывать чужой трафик.
+[ -z "$ONLY_SLOT" ] && hl_gc_orphans "$(awk -F'\t' '{print $1}' "$SNAP" 2>/dev/null | tr '\n' ' ')"
+
 date +%s >"$HL_RUN/last-run"
-
-if [ "$seen" = 0 ]; then
-    warn "модемов не найдено (искал вендоров: $HL_VENDORS)"
-else
-    info "цикл завершён: найдено $seen, в норме $ok, с проблемами $bad"
-fi
+info "цикл завершён: найдено $TOTAL, в норме $ok, с проблемами $bad (потоков $PAR)"
 
 exit 0

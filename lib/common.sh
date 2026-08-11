@@ -17,8 +17,8 @@ HL_SUBNET_PREFIX="192.168"      # модем N живёт в $PREFIX.$N.0/24
 HL_HOST_OCTET=100               # адрес хоста в подсети модема
 HL_GW_OCTET=1                   # адрес модема (веб-морда HiLink)
 HL_TABLE_BASE=10000             # таблица policy routing = BASE + N
-HL_SLOT_MIN=101                 # диапазон номеров модемов
-HL_SLOT_MAX=250
+HL_SLOT_MIN=2                   # диапазон номеров модемов (3-й октет подсети)
+HL_SLOT_MAX=254                 # 253 модема на префикс; больше — меняй HL_SUBNET_PREFIX
 HL_IFACE_PREFIX="mdm"           # имя интерфейса = mdm<N>
 
 # Жёсткая привязка «USB-порт:номер» через пробел, например "3-3:104 3-1.4.1.1:101".
@@ -42,6 +42,15 @@ HL_WATCHDOG_ENABLE=1
 HL_WATCHDOG_PING="1.1.1.1"      # что пинговать через модем для проверки живости
 HL_WATCHDOG_FAILS=3             # неудач подряд до эскалации
 HL_WATCHDOG_ESCALATE=1          # 1 = разрешить usb reset при глухом модеме
+
+# ------------------------------------------------------------- масштаб -----
+# Модемов может быть под три сотни. Структурная часть цикла дешёвая (только
+# sysfs и ip), а вот пинги и веб-API стоят секунд — поэтому они идут
+# параллельно и не на каждом цикле.
+
+HL_PARALLEL=auto                # число рабочих потоков; auto = nproc, максимум 32
+HL_HEALTH_INTERVAL=120          # как часто проверять живость каждого модема, сек
+HL_GC=1                         # убирать правила и маршруты исчезнувших слотов
 
 HL_LOG_LEVEL=info               # debug | info | warn | error
 HL_LOG_STDERR=auto              # auto | 1 | 0  (auto: в tty пишем, иначе только journal)
@@ -67,41 +76,37 @@ HL_REGISTRY="${HL_REGISTRY:-$HL_REGISTRY_DEFAULT}"
 
 # ------------------------------------------------------------------- лог ----
 
-_hl_lvl_num() {
-    case "$1" in
-        debug) echo 10 ;; info) echo 20 ;;
-        warn)  echo 30 ;; error) echo 40 ;; *) echo 20 ;;
-    esac
-}
+# Логгер зовётся по несколько раз на каждый модем. При двух сотнях модемов
+# любая подоболочка или проверка внешней команды внутри него превращается
+# в тысячи запусков процессов, поэтому всё решается заранее и один раз.
 
-_HL_LVL=$(_hl_lvl_num "$HL_LOG_LEVEL")
+case "$HL_LOG_LEVEL" in
+    debug) _HL_LVL=10 ;; warn) _HL_LVL=30 ;; error) _HL_LVL=40 ;; *) _HL_LVL=20 ;;
+esac
 
-_hl_want_stderr() {
-    case "$HL_LOG_STDERR" in
-        1) return 0 ;;
-        0) return 1 ;;
-        *) [ -t 2 ] ;;
-    esac
-}
+if command -v systemd-cat >/dev/null 2>&1; then _HL_CAT=1; else _HL_CAT=0; fi
+
+case "$HL_LOG_STDERR" in
+    1) _HL_ERR=1 ;;
+    0) _HL_ERR=0 ;;
+    *) if [ -t 2 ]; then _HL_ERR=1; else _HL_ERR=0; fi ;;
+esac
 
 log() {
     local lvl="$1"; shift
-    [ "$(_hl_lvl_num "$lvl")" -ge "$_HL_LVL" ] || return 0
-    local msg="$*"
-    local pri
+    local num pri c
     case "$lvl" in
-        debug) pri=7 ;; info) pri=6 ;; warn) pri=4 ;; error) pri=3 ;; *) pri=6 ;;
+        debug) num=10; pri=7; c='\033[90m' ;;
+        info)  num=20; pri=6; c='\033[36m' ;;
+        warn)  num=30; pri=4; c='\033[33m' ;;
+        error) num=40; pri=3; c='\033[31m' ;;
+        *)     num=20; pri=6; c='' ;;
     esac
-    command -v systemd-cat >/dev/null 2>&1 &&
-        printf '%s\n' "$msg" | systemd-cat -t hivelink -p "$pri" 2>/dev/null
-    if _hl_want_stderr; then
-        local c=""
-        case "$lvl" in
-            debug) c='\033[90m' ;; info) c='\033[36m' ;;
-            warn)  c='\033[33m' ;; error) c='\033[31m' ;;
-        esac
-        printf "${c}%-5s\033[0m %s\n" "$lvl" "$msg" >&2
-    fi
+    [ "$num" -ge "$_HL_LVL" ] || return 0
+
+    [ "$_HL_CAT" = 1 ] && printf '%s\n' "$*" | systemd-cat -t hivelink -p "$pri" 2>/dev/null
+    [ "$_HL_ERR" = 1 ] && printf "${c}%-5s\033[0m %s\n" "$lvl" "$*" >&2
+    return 0
 }
 
 dbg()  { log debug "$@"; }
@@ -131,6 +136,15 @@ require() {
 hl_lock() {
     local name="${1:-global}" fd
     mkdir -p "$HL_RUN"
+
+    # Без flock блокировки не будет. Это деградация, а не повод молча выйти:
+    # цикл всё равно должен отработать, но пользователь обязан узнать почему.
+    if ! command -v flock >/dev/null 2>&1; then
+        err "нет flock (apt install util-linux) — работаю БЕЗ блокировки;"
+        err "при одновременном запуске возможны гонки за маршруты"
+        return 0
+    fi
+
     exec {fd}>"$HL_RUN/$name.lock" || die "не открыть лок $name"
     if ! flock -w "${2:-60}" "$fd"; then
         warn "лок '$name' занят дольше ${2:-60}с — выхожу, отработает следующий цикл"
@@ -147,10 +161,32 @@ hl_lock() {
 HL_SLOTS="$HL_VAR/slots"
 HL_CONFMAP="$HL_VAR/confmap"
 
+declare -A HL_MAP_PORT2SLOT=()   # usb-путь -> номер
+declare -A HL_MAP_USED=()        # номер -> занят
+
 hl_state_init() {
     mkdir -p "$HL_VAR" "$HL_RUN"
     [ -f "$HL_SLOTS" ]   || : >"$HL_SLOTS"
     [ -f "$HL_CONFMAP" ] || : >"$HL_CONFMAP"
+    hl_slots_load
+}
+
+# Карта грузится в память один раз за цикл. При 200 модемах любой поиск
+# через awk или grep превращается в тысячи запусков процессов, поэтому
+# вся работа с номерами идёт по ассоциативным массивам.
+hl_slots_load() {
+    local p n pin
+    HL_MAP_PORT2SLOT=(); HL_MAP_USED=()
+    while read -r p n; do
+        [ -n "${p:-}" ] && [ -n "${n:-}" ] || continue
+        HL_MAP_PORT2SLOT["$p"]="$n"
+        HL_MAP_USED["$n"]=1
+    done <"$HL_SLOTS"
+    # Закреплённые в конфиге номера тоже заняты, иначе автовыдача
+    # наступит на пин и два модема получат один адрес.
+    for pin in $HL_SLOT_PIN; do
+        [ -n "$pin" ] && HL_MAP_USED["${pin#*:}"]=1
+    done
 }
 
 # Номер модема по USB-пути. Привязка вечная: тот же физический порт —
@@ -161,43 +197,100 @@ hl_state_init() {
 #   2) ранее выданный номер из карты слотов
 #   3) первый свободный номер, с записью в карту
 hl_slot_for_port() {
-    local port="$1" n pin
+    local port="$1" n pin old n2
 
+    # 1) пин из конфига
     for pin in $HL_SLOT_PIN; do
         case "$pin" in
-            "$port":*) printf '%s\n' "${pin#*:}"; return 0 ;;
+            "$port":*)
+                n="${pin#*:}"
+                # В карте мог остаться старый автономер этого же порта.
+                # Если его не снять, он навечно займёт номер, который никому
+                # уже не принадлежит, и следующий модем получит не тот адрес.
+                old="${HL_MAP_PORT2SLOT[$port]:-}"
+                if [ -n "$old" ] && [ "$old" != "$n" ]; then
+                    warn "порт $port: пин $n перекрывает выданный ранее $old — снимаю старую запись"
+                    hl_slot_forget_port "$port"
+                    hl_slot_mark_stale "$old"
+                    unset "HL_MAP_PORT2SLOT[$port]" "HL_MAP_USED[$old]"
+                fi
+                printf '%s\n' "$n"; return 0 ;;
         esac
     done
 
-    n=$(awk -v p="$port" '$1==p{print $2; exit}' "$HL_SLOTS" 2>/dev/null)
+    # 2) ранее выданный
+    n="${HL_MAP_PORT2SLOT[$port]:-}"
     if [ -n "$n" ]; then printf '%s\n' "$n"; return 0; fi
 
-    # Занятыми считаем и выданные ранее, и закреплённые в конфиге —
-    # иначе автовыдача наступит на пин и два модема получат один адрес.
-    local used n2
-    used=$( { awk '{print $2}' "$HL_SLOTS" 2>/dev/null
-              for pin in $HL_SLOT_PIN; do printf '%s\n' "${pin#*:}"; done
-            } | sort -n )
+    # 3) первый свободный
     n2="$HL_SLOT_MIN"
     while [ "$n2" -le "$HL_SLOT_MAX" ]; do
-        printf '%s\n' "$used" | grep -qx "$n2" || break
+        [ -z "${HL_MAP_USED[$n2]:-}" ] && break
         n2=$((n2 + 1))
     done
-    [ "$n2" -le "$HL_SLOT_MAX" ] || { err "кончились номера ($HL_SLOT_MIN..$HL_SLOT_MAX)"; return 1; }
+    [ "$n2" -le "$HL_SLOT_MAX" ] || {
+        err "кончились номера ($HL_SLOT_MIN..$HL_SLOT_MAX), это потолок в $((HL_SLOT_MAX - HL_SLOT_MIN + 1)) модемов на префикс $HL_SUBNET_PREFIX"
+        return 1
+    }
 
     printf '%s %s\n' "$port" "$n2" >>"$HL_SLOTS"
+    HL_MAP_PORT2SLOT["$port"]="$n2"
+    HL_MAP_USED["$n2"]=1
     info "новый модем на порту $port -> слот $n2 (закреплено навсегда)"
     printf '%s\n' "$n2"
 }
 
 hl_port_for_slot() { awk -v n="$1" '$2==n{print $1; exit}' "$HL_SLOTS" 2>/dev/null; }
 
+hl_slot_forget_port() {
+    local port="$1" tmp
+    tmp=$(mktemp "$HL_SLOTS.XXXXXX" 2>/dev/null) || return 0
+    awk -v p="$port" '$1!=p' "$HL_SLOTS" 2>/dev/null >"$tmp" && mv -f "$tmp" "$HL_SLOTS"
+    rm -f "$tmp" 2>/dev/null
+    return 0
+}
+
+# Номер, переставший принадлежать порту. Помечаем, чтобы сборщик мусора
+# снял его правило и таблицу маршрутов, а не оставил перехватывать чужой трафик.
+hl_slot_mark_stale() { printf '%s\n' "$1" >>"$HL_RUN/stale-slots"; }
+
 hl_confmap_get() { awk -v k="$1" '$1==k{print $2; exit}' "$HL_CONFMAP" 2>/dev/null; }
+
+# Пишется из параллельных рабочих потоков, поэтому под собственным локом:
+# без него read-modify-write двух потоков затрёт друг друга.
+# Нет flock — пишем без него: потерять запись кэша не страшно,
+# а вот молча не писать вообще — это уже скрытый отказ.
 hl_confmap_set() {
-    local k="$1" v="$2" tmp="$HL_CONFMAP.$$"
-    awk -v k="$k" '$1!=k' "$HL_CONFMAP" 2>/dev/null >"$tmp"
-    printf '%s %s\n' "$k" "$v" >>"$tmp"
-    mv -f "$tmp" "$HL_CONFMAP"
+    local k="$1" v="$2" tmp lfd locked=0
+    # НЕ "$HL_CONFMAP.$$": в фоновом процессе bash подставляет PID родителя,
+    # и все параллельные потоки получат одно и то же имя файла.
+    tmp=$(mktemp "$HL_CONFMAP.XXXXXX" 2>/dev/null) || return 0
+
+    if command -v flock >/dev/null 2>&1; then
+        if exec {lfd}>"$HL_RUN/confmap.lock" 2>/dev/null; then
+            flock -w 5 "$lfd" 2>/dev/null && locked=1
+        fi
+    fi
+
+    { awk -v k="$k" '$1!=k' "$HL_CONFMAP" 2>/dev/null
+      printf '%s %s\n' "$k" "$v"; } >"$tmp" && mv -f "$tmp" "$HL_CONFMAP"
+    rm -f "$tmp" 2>/dev/null
+
+    [ "$locked" = 1 ] && exec {lfd}>&-
+    return 0
+}
+
+# Число рабочих потоков: столько ядер, сколько есть, но не больше 32 —
+# упираемся не в CPU, а в таймауты пингов и веб-API.
+hl_parallelism() {
+    local p="${HL_PARALLEL:-auto}"
+    if [ "$p" = auto ]; then
+        p=$(nproc 2>/dev/null || echo 4)
+        p=$((p * 2))
+    fi
+    [ "$p" -lt 1 ] 2>/dev/null && p=1
+    [ "$p" -gt 32 ] 2>/dev/null && p=32
+    printf '%s\n' "$p"
 }
 
 # ---------------------------------------------------------------- адреса ----
