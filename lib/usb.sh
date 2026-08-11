@@ -85,12 +85,28 @@ hl_guess_driver() {
 # Старый стек здесь молча выходил, если не было usb_modeswitch. Не повторяем.
 
 hl_modeswitch() {
-    local port="$1" vid="$2" pid="$3" tries=0 cfg
+    local port="$1" vid="$2" pid="$3" tries=0 cfg cur total
 
     require usb_modeswitch usb-modeswitch "$HL_MODESWITCH_REQUIRED" || {
         err "$port: устройство в Zero-CD ($vid:$pid), а переключать нечем — модем не поднимется"
         return 1
     }
+
+    # Ядро могло сесть не на ту конфигурацию. У этих устройств в Zero-CD
+    # бывает вторая конфигурация с MBIM: cdc_mbim её захватывает, появляется
+    # бесполезный wwanN, а mass-storage endpoint, куда usb_modeswitch шлёт
+    # своё сообщение, в ней просто отсутствует. Отсюда бесконечные
+    # безрезультатные попытки. Сначала возвращаем конфигурацию 1.
+    cur=$(hl_cfg_current "$port")
+    total=$(hl_cfg_count "$port")
+    if [ -n "$cur" ] && [ "$cur" != 1 ] && [ "$total" -gt 1 ] 2>/dev/null; then
+        warn "$port: Zero-CD в конфигурации $cur из $total — usb_modeswitch там бессилен, ставлю 1"
+        if hl_cfg_set "$port" 1; then
+            sleep 2
+            pid=$(hl_dev_attr "$port" idProduct)
+            hl_is_zerocd "$pid" || { info "$port: после смены конфигурации уже $vid:$pid"; return 0; }
+        fi
+    fi
 
     cfg="/etc/usb_modeswitch.d/$vid:$pid"
     [ -f "$cfg" ] || cfg="/usr/share/usb_modeswitch/$vid:$pid"
@@ -184,13 +200,43 @@ hl_cfg_set() {
     return 1
 }
 
-# Подобрать конфигурацию, при которой появляется сетевой интерфейс.
-# Возвращает 0, если сеть есть (в том числе если была изначально).
+# ГОДНЫЙ интерфейс, а не любой.
+#
+# wwanN на cdc_mbim/qmi_wwan — это raw-IP без DHCP и без веб-морды HiLink.
+# Формально сетевой интерфейс есть, фактически модем бесполезен: адреса
+# взять неоткуда, API недостижим. Считать такую конфигурацию удачной —
+# значит своими руками загнать модем в нерабочее состояние.
+hl_netdev_usable() {
+    local port="$1" iface drv
+    iface=$(hl_netdev_of_port "$port" 2>/dev/null) || return 1
+    drv=$(basename "$(readlink -f "/sys/class/net/$iface/device/driver" 2>/dev/null)" 2>/dev/null)
+    case "$drv" in
+        rndis_host|cdc_ether|cdc_ncm|huawei_cdc_ncm) ;;
+        *) dbg "$port: $iface на драйвере '$drv' — не годится"; return 1 ;;
+    esac
+    # NOARP = raw-IP режим, DHCP по нему не поедет
+    case "$(cat "/sys/class/net/$iface/flags" 2>/dev/null)" in
+        "") return 1 ;;
+    esac
+    if ip link show "$iface" 2>/dev/null | grep -q NOARP; then
+        dbg "$port: $iface в режиме NOARP (raw-IP) — DHCP и веб-морда недоступны"
+        return 1
+    fi
+    printf '%s\n' "$iface"
+    return 0
+}
+
+# Подобрать конфигурацию, при которой появляется ГОДНЫЙ интерфейс.
+# Возвращает 0, если он есть (в том числе если был изначально).
 hl_cfg_probe() {
-    local port="$1" model="$2" total cur known n try
+    local port="$1" model="$2" total cur known n try start
 
     [ "${HL_CFG_PROBE:-1}" = 1 ] || return 1
-    hl_netdev_of_port "$port" >/dev/null 2>&1 && return 0
+    hl_netdev_usable "$port" >/dev/null 2>&1 && return 0
+
+    # Запоминаем, с чего начали: если перебор ничего не даст, надо
+    # вернуть модем как было, а не бросить в случайной конфигурации.
+    start=$(hl_cfg_current "$port")
 
     total=$(hl_cfg_count "$port")
     [ "$total" -gt 1 ] 2>/dev/null || {
@@ -204,14 +250,14 @@ hl_cfg_probe() {
         cur=$(hl_cfg_current "$port")
         if [ "$cur" != "$known" ]; then
             info "$port: ставлю известную для модели конфигурацию $known"
-            hl_cfg_set "$port" "$known" && hl_netdev_of_port "$port" >/dev/null 2>&1 && return 0
+            hl_cfg_set "$port" "$known" && hl_netdev_usable "$port" >/dev/null 2>&1 && return 0
         fi
     fi
 
     try=$(hl_cnt_get cfg "$port")
     if [ "$try" -ge "${HL_CFG_MAX_TRIES:-6}" ]; then
-        warn "$port: перебор конфигураций исчерпан ($try), сажаю на ${known:-1}"
-        hl_cfg_set "$port" "${known:-1}" >/dev/null 2>&1
+        warn "$port: перебор конфигураций исчерпан ($try), возвращаю исходную $start"
+        hl_cfg_set "$port" "${known:-$start}" >/dev/null 2>&1
         return 1
     fi
 
@@ -220,16 +266,19 @@ hl_cfg_probe() {
         [ "$(hl_cfg_current "$port")" = "$n" ] && continue
         info "$port: пробую конфигурацию $n из $total"
         hl_cfg_set "$port" "$n" || continue
-        if hl_netdev_of_port "$port" >/dev/null 2>&1; then
-            info "$port: конфигурация $n дала сеть — запоминаю для модели $model"
+        if hl_netdev_usable "$port" >/dev/null 2>&1; then
+            info "$port: конфигурация $n дала годный интерфейс — запоминаю для модели $model"
             hl_confmap_set "cfg:$model" "$n"
             hl_cnt_clear cfg "$port"
             return 0
         fi
-        dbg "$port: конфигурация $n без сетевой функции"
+        dbg "$port: конфигурация $n не дала годного интерфейса"
     done
 
-    warn "$port: ни одна из $total конфигураций не дала сетевой интерфейс"
+    # Ничего не подошло — возвращаем как было. Оставить модем в чужой
+    # конфигурации хуже, чем не трогать вовсе.
+    warn "$port: ни одна из $total конфигураций не дала годного интерфейса, откатываю на $start"
+    [ -n "$start" ] && hl_cfg_set "$port" "$start" >/dev/null 2>&1
     return 1
 }
 

@@ -181,13 +181,26 @@ hl_subnet_conflict() {
 # При статике этого не случается, но проверяем и чиним на всякий случай:
 # путей утечки много (dhclient-хуки, networkd, NM).
 
+# Угон — это когда в резолвере стоит адрес КОНКРЕТНОГО модема, то есть
+# PREFIX.N.GW для активного слота N.
+#
+# Раньше проверка ловила любой адрес из PREFIX/16 и считала угоном штатный
+# LAN-шлюз хоста (192.168.1.1). При заданном HL_DNS_UPSTREAM это переписало
+# бы совершенно исправный resolv.conf.
 hl_dns_hijacked() {
-    local f=/etc/resolv.conf ns
+    local f=/etc/resolv.conf ns n
     [ -r "$f" ] || return 1
     while read -r ns; do
-        case "$ns" in
-            "$HL_SUBNET_PREFIX".*) return 0 ;;
-        esac
+        [ -n "$ns" ] || continue
+        case "$ns" in "$HL_SUBNET_PREFIX".*) ;; *) continue ;; esac
+        # последний октет должен быть адресом модема
+        [ "${ns##*.}" = "$HL_GW_OCTET" ] || continue
+        n=$(printf '%s' "$ns" | cut -d. -f3)
+        # и третий октет — номером слота, который мы действительно обслуживаем
+        if [ -n "${HL_MAP_USED[$n]:-}" ]; then
+            dbg "резолвер указывает на модем слота $n ($ns)"
+            return 0
+        fi
     done < <(awk '/^nameserver/{print $2}' "$f" 2>/dev/null)
     return 1
 }

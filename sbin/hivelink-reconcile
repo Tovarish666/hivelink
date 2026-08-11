@@ -57,19 +57,25 @@ hl_networkd_dropin
 # и параллельный доступ к ней породил бы двух модемов с одним адресом.
 
 DEVS=()
+PENDING=()
 while read -r port vid pid bcd; do
     [ -n "$port" ] || continue
     # Без подстановки $(...): она создаёт подоболочку, и обновления карты
     # слотов в памяти не дожили бы до следующей итерации — все модемы
     # цикла получили бы один и тот же номер.
-    hl_slot_for_port "$port" >/dev/null || continue
-    slot="$HL_SLOT"
-    [ -n "$slot" ] || continue
-    [ -n "$ONLY_SLOT" ] && [ "$slot" != "$ONLY_SLOT" ] && continue
-    DEVS+=("$port|$vid|$pid|$bcd|$slot")
+    if hl_slot_for_port "$port" >/dev/null && [ -n "$HL_SLOT" ]; then
+        slot="$HL_SLOT"
+        [ -n "$ONLY_SLOT" ] && [ "$slot" != "$ONLY_SLOT" ] && continue
+        DEVS+=("$port|$vid|$pid|$bcd|$slot")
+    else
+        # Номер не подтверждён. Адрес не назначаем и железо не трогаем —
+        # только разведка. Неверный адрес промахнётся мимо подсети модема
+        # и запустит лечение против исправного устройства.
+        [ -n "$ONLY_SLOT" ] || PENDING+=("$port|$vid|$pid|$bcd")
+    fi
 done <<<"$(hl_usb_devices)"
 
-TOTAL=${#DEVS[@]}
+TOTAL=$(( ${#DEVS[@]} + ${#PENDING[@]} ))
 if [ "$TOTAL" = 0 ]; then
     warn "модемов не найдено (искал вендоров: $HL_VENDORS)"
     : >"$SNAP"; date +%s >"$HL_RUN/last-run"
@@ -192,18 +198,49 @@ worker() {
     fi
 }
 
+# Разведчик для модемов с неподтверждённым номером: поднимает линк,
+# спрашивает у модема его подсеть через DHCP и записывает подсказку.
+# Ни адресов, ни маршрутов, ни сброса устройства.
+scout() {
+    local spec="$1" port vid pid bcd iface found
+    IFS='|' read -r port vid pid bcd <<<"$spec"
+    local out="$WORKDIR/p_$(printf '%s' "$port" | tr '.:/' '___')"
+
+    hl_disable_autosuspend "$port"
+
+    if hl_is_zerocd "$pid"; then
+        hl_modeswitch "$port" "$vid" "$pid" >/dev/null 2>&1 || {
+            printf '%s\t%s\t%s\t%s\t%s\n' 0 "$port" "-" zerocd "не переключился" >"$out"; return; }
+        pid=$(hl_dev_attr "$port" idProduct)
+    fi
+
+    iface=$(hl_netdev_of_port "$port" 2>/dev/null) || {
+        printf '%s\t%s\t%s\t%s\t%s\n' 0 "$port" "-" nodrv "нет интерфейса ($vid:$pid)" >"$out"; return; }
+
+    found=$(hl_discover_lan "$iface" 2>/dev/null)
+    if [ -n "$found" ]; then
+        hl_lanhint_set "$port" "$found"
+        hl_cnt_clear discover "$port"
+        printf '%s\t%s\t%s\t%s\t%s\n' "$found" "$port" "$iface" found "модем в подсети $found" >"$out"
+    else
+        printf '%s\t%s\t%s\t%s\t%s\n' 0 "$port" "$iface" scout "разведка: модем не ответил по DHCP" >"$out"
+    fi
+}
+
 PAR=$(hl_parallelism)
-dbg "обрабатываю $TOTAL модемов в $PAR потоков"
+dbg "обрабатываю ${#DEVS[@]} с номером и ${#PENDING[@]} на разведке, потоков $PAR"
 
 running=0
-for spec in "${DEVS[@]}"; do
-    worker "$spec" &
+launch() {
+    "$@" &
     running=$((running + 1))
     if [ "$running" -ge "$PAR" ]; then
-        if wait -n 2>/dev/null; then :; else wait; running=0; continue; fi
-        running=$((running - 1))
+        if wait -n 2>/dev/null; then running=$((running - 1)); else wait; running=0; fi
     fi
-done
+}
+
+for spec in ${DEVS[@]+"${DEVS[@]}"};    do launch worker "$spec"; done
+for spec in ${PENDING[@]+"${PENDING[@]}"}; do launch scout  "$spec"; done
 wait
 
 # ============================================================ фаза 3 ========
