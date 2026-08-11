@@ -122,13 +122,24 @@ hl_modeswitch() {
 }
 
 # ------------------------------------------------------------- сброс USB ---
+#
+# Потолок обязателен: без него модем, который не оживает в принципе,
+# будет пересоздаваться вечно и мешать соседям по хабу. Счётчик
+# сбрасывается ТОЛЬКО при успешном выходе модема в сеть.
 
 hl_usb_reset() {
-    local port="$1" p
+    local port="$1" p n
     p=$(hl_dev_path "$port")
     [ -d "$p" ] || return 1
+
+    n=$(hl_cnt_bump reenum "$port")
+    if [ "$n" -gt "${HL_REENUM_MAX:-5}" ]; then
+        warn "$port: уже $((n - 1)) re-enumerate без толку — больше не трогаю до успеха"
+        return 1
+    fi
+
     if [ -w "$p/authorized" ]; then
-        info "$port: re-enumerate через authorized"
+        info "$port: re-enumerate через authorized (попытка $n/${HL_REENUM_MAX:-5})"
         echo 0 >"$p/authorized" 2>/dev/null
         sleep 2
         echo 1 >"$p/authorized" 2>/dev/null
@@ -136,6 +147,89 @@ hl_usb_reset() {
         return 0
     fi
     warn "$port: сбросить не получилось (нет authorized)"
+    return 1
+}
+
+# ------------------------------------------- перебор USB-конфигураций ------
+#
+# Ядро само выбирает конфигурацию и порой садится не на ту: у HiLink это
+# обычно NCM-конфигурация, дающая wwanN без DHCP вместо ethN с DHCP.
+# Перебираем bConfigurationValue и запоминаем удачную ПО МОДЕЛИ, чтобы
+# одинаковые модемы правились сразу, без перебора.
+#
+# Запись bConfigurationValue при активной конфигурации отбивается EBUSY,
+# поэтому сначала -1 (расконфигурировать), и только потом целевое значение.
+
+hl_cfg_count() {
+    local port="$1" v
+    v=$(hl_dev_attr "$port" bNumConfigurations)
+    printf '%s\n' "${v:-1}"
+}
+
+hl_cfg_current() { hl_dev_attr "$1" bConfigurationValue; }
+
+hl_cfg_set() {
+    local port="$1" val="$2" f
+    f="$(hl_dev_path "$port")/bConfigurationValue"
+    [ -w "$f" ] || { dbg "$port: bConfigurationValue не пишется"; return 1; }
+
+    # Расконфигурировать, иначе ядро вернёт EBUSY
+    echo -1 >"$f" 2>/dev/null
+    sleep 1
+    if echo "$val" >"$f" 2>/dev/null; then
+        sleep 2
+        return 0
+    fi
+    warn "$port: не удалось выставить конфигурацию $val"
+    return 1
+}
+
+# Подобрать конфигурацию, при которой появляется сетевой интерфейс.
+# Возвращает 0, если сеть есть (в том числе если была изначально).
+hl_cfg_probe() {
+    local port="$1" model="$2" total cur known n try
+
+    [ "${HL_CFG_PROBE:-1}" = 1 ] || return 1
+    hl_netdev_of_port "$port" >/dev/null 2>&1 && return 0
+
+    total=$(hl_cfg_count "$port")
+    [ "$total" -gt 1 ] 2>/dev/null || {
+        dbg "$port: конфигурация одна, перебирать нечего"
+        return 1
+    }
+
+    # Удачная конфигурация для этой модели уже известна?
+    known=$(hl_confmap_get "cfg:$model")
+    if [ -n "$known" ] && [ "$known" != none ]; then
+        cur=$(hl_cfg_current "$port")
+        if [ "$cur" != "$known" ]; then
+            info "$port: ставлю известную для модели конфигурацию $known"
+            hl_cfg_set "$port" "$known" && hl_netdev_of_port "$port" >/dev/null 2>&1 && return 0
+        fi
+    fi
+
+    try=$(hl_cnt_get cfg "$port")
+    if [ "$try" -ge "${HL_CFG_MAX_TRIES:-6}" ]; then
+        warn "$port: перебор конфигураций исчерпан ($try), сажаю на ${known:-1}"
+        hl_cfg_set "$port" "${known:-1}" >/dev/null 2>&1
+        return 1
+    fi
+
+    for n in $(seq 1 "$total"); do
+        hl_cnt_bump cfg "$port" >/dev/null
+        [ "$(hl_cfg_current "$port")" = "$n" ] && continue
+        info "$port: пробую конфигурацию $n из $total"
+        hl_cfg_set "$port" "$n" || continue
+        if hl_netdev_of_port "$port" >/dev/null 2>&1; then
+            info "$port: конфигурация $n дала сеть — запоминаю для модели $model"
+            hl_confmap_set "cfg:$model" "$n"
+            hl_cnt_clear cfg "$port"
+            return 0
+        fi
+        dbg "$port: конфигурация $n без сетевой функции"
+    done
+
+    warn "$port: ни одна из $total конфигураций не дала сетевой интерфейс"
     return 1
 }
 
@@ -166,6 +260,39 @@ hl_disable_autosuspend() {
         echo on >"$p/power/control" 2>/dev/null &&
             dbg "$port: autosuspend выключен"
     fi
+    return 0
+}
+
+# Уснувший ХАБ утаскивает за собой всю ветку — модемы под ним просто
+# исчезают, и это выглядит как отказ железа. Гасим энергосбережение
+# на всех хабах, а не только на модемах.
+hl_disable_hub_autosuspend() {
+    local d n=0
+    for d in /sys/bus/usb/devices/*/; do
+        [ -f "$d/bDeviceClass" ] || continue
+        [ "$(cat "$d/bDeviceClass" 2>/dev/null)" = "09" ] || continue
+        [ -w "$d/power/control" ] || continue
+        if [ "$(cat "$d/power/control" 2>/dev/null)" != "on" ]; then
+            echo on >"$d/power/control" 2>/dev/null && n=$((n + 1))
+        fi
+        # autosuspend_delay -1 запрещает засыпание окончательно
+        [ -w "$d/power/autosuspend_delay_ms" ] &&
+            echo -1 >"$d/power/autosuspend_delay_ms" 2>/dev/null
+    done
+    [ "$n" -gt 0 ] && info "погашен autosuspend на $n хабах"
+    return 0
+}
+
+# Буфер usbfs. По умолчанию 16 МБ на всё ядро. При десятках модемов
+# с крупными RX-URB (наш фикс поднимает их до 16 КБ) это упирается,
+# и submit начинает падать с ENOMEM — выглядит как случайные обрывы.
+hl_usbfs_tune() {
+    local want="${HL_USBFS_MB:-1024}" f=/sys/module/usbcore/parameters/usbfs_memory_mb cur
+    [ -w "$f" ] || return 0
+    cur=$(cat "$f" 2>/dev/null || echo 0)
+    [ "$cur" -ge "$want" ] 2>/dev/null && return 0
+    echo "$want" >"$f" 2>/dev/null && info "usbfs_memory_mb: $cur -> $want"
+    return 0
 }
 
 # --------------------------------------------------- переименование ссылки --

@@ -52,6 +52,31 @@ HL_PARALLEL=auto                # число рабочих потоков; auto
 HL_HEALTH_INTERVAL=120          # как часто проверять живость каждого модема, сек
 HL_GC=1                         # убирать правила и маршруты исчезнувших слотов
 
+# Буфер usbfs на ядро. По умолчанию 16 МБ — при десятках модемов с крупными
+# RX-URB (см. фикс rndis_host) этого не хватает, и submit начинает падать.
+HL_USBFS_MB=1024
+
+# ----------------------------------------------------------- устойчивость --
+# Счётчики, без которых драйвер уходит в бесконечные циклы.
+
+HL_NODRV_GRACE=3                # циклов ждать привязку драйвера, прежде чем дёргать
+HL_CFG_MAX_TRIES=6              # потолок перебора USB-конфигураций на порт
+HL_REENUM_MAX=5                 # потолок принудительных re-enumerate на порт
+HL_CFG_PROBE=1                  # 1 = перебирать bConfigurationValue, если сеть не поднялась
+
+# --------------------------------------------------------- идентификация --
+# port — номер закреплён за физическим гнездом (по умолчанию; годится, когда
+#        «седьмое гнездо всегда седьмой модем»)
+# imei — номер следует за устройством при перетыкании в другое гнездо
+# Привязка по IMEI возможна только после первого успешного выхода в сеть:
+# до этого IMEI неоткуда взять, USB-дескриптор у HiLink отдаёт SerialNumber=0.
+HL_IDENTITY=port
+
+# Подсети, которые нельзя занимать: третьи октеты, уже используемые хостом.
+# Пустое значение = определить автоматически из таблицы маршрутов.
+# Без этого на хосте с LAN 192.168.1.0/24 модем со слотом 1 угнал бы шлюз.
+HL_SUBNET_AVOID=""
+
 HL_LOG_LEVEL=info               # debug | info | warn | error
 HL_LOG_STDERR=auto              # auto | 1 | 0  (auto: в tty пишем, иначе только journal)
 
@@ -187,6 +212,22 @@ hl_slots_load() {
     for pin in $HL_SLOT_PIN; do
         [ -n "$pin" ] && HL_MAP_USED["${pin#*:}"]=1
     done
+    # Подсети, занятые самим хостом, тоже вне игры.
+    for n in $(hl_subnets_in_use); do HL_MAP_USED["$n"]=1; done
+}
+
+# Третьи октеты, которые уже заняты на хосте в нашем префиксе.
+# Классический выстрел в ногу: LAN сервера 192.168.1.0/24, модем получает
+# слот 1 и уводит на себя весь трафик к шлюзу.
+hl_subnets_in_use() {
+    if [ -n "$HL_SUBNET_AVOID" ]; then
+        printf '%s\n' "$HL_SUBNET_AVOID" | tr ' ,' '\n\n'
+        return 0
+    fi
+    local p1="${HL_SUBNET_PREFIX%%.*}" p2="${HL_SUBNET_PREFIX##*.}"
+    {   ip -4 route show 2>/dev/null | awk '{print $1}'
+        ip -4 addr show 2>/dev/null | awk '/inet /{print $2}'
+    } | awk -F'[./]' -v a="$p1" -v b="$p2" '$1==a && $2==b {print $3}' | sort -un
 }
 
 # Номер модема по USB-пути. Привязка вечная: тот же физический порт —
@@ -196,10 +237,40 @@ hl_slots_load() {
 #   1) HL_SLOT_PIN из конфига — декларативно, переживает потерю состояния
 #   2) ранее выданный номер из карты слотов
 #   3) первый свободный номер, с записью в карту
-hl_slot_for_port() {
-    local port="$1" n pin old n2
+#
+# ВАЖНО: результат кладётся в глобальную HL_SLOT, а не только печатается.
+# Вызов через $(...) породил бы подоболочку, обновления карты в памяти
+# до родителя не дожили бы, и все модемы одного цикла получили бы один
+# и тот же номер. Правильный вызов:
+#     hl_slot_for_port "$port" >/dev/null || continue
+#     slot="$HL_SLOT"
+HL_SLOT=""
 
-    # 1) пин из конфига
+hl_slot_for_port() {
+    local port="$1" n pin old n2 imei
+
+    # 0) пин по IMEI — единственная форма, переносимая между серверами:
+    #    USB-путь у каждого хоста свой, а IMEI живёт в самом модеме.
+    #    Работает со второго цикла: IMEI узнаётся только через веб-API.
+    imei=$(hl_imei_get "$port")
+    if [ -n "$imei" ]; then
+        for pin in $HL_SLOT_PIN; do
+            case "$pin" in
+                "imei:$imei:"*)
+                    n="${pin##*:}"
+                    old="${HL_MAP_PORT2SLOT[$port]:-}"
+                    if [ -n "$old" ] && [ "$old" != "$n" ]; then
+                        info "IMEI $imei переехал: слот $old -> $n"
+                        hl_slot_forget_port "$port"; hl_slot_mark_stale "$old"
+                        unset "HL_MAP_PORT2SLOT[$port]" "HL_MAP_USED[$old]"
+                    fi
+                    HL_MAP_PORT2SLOT["$port"]="$n"; HL_MAP_USED["$n"]=1
+                    HL_SLOT="$n"; printf '%s\n' "$n"; return 0 ;;
+            esac
+        done
+    fi
+
+    # 1) пин по USB-порту
     for pin in $HL_SLOT_PIN; do
         case "$pin" in
             "$port":*)
@@ -214,13 +285,14 @@ hl_slot_for_port() {
                     hl_slot_mark_stale "$old"
                     unset "HL_MAP_PORT2SLOT[$port]" "HL_MAP_USED[$old]"
                 fi
-                printf '%s\n' "$n"; return 0 ;;
+                HL_MAP_PORT2SLOT["$port"]="$n"; HL_MAP_USED["$n"]=1
+                HL_SLOT="$n"; printf '%s\n' "$n"; return 0 ;;
         esac
     done
 
     # 2) ранее выданный
     n="${HL_MAP_PORT2SLOT[$port]:-}"
-    if [ -n "$n" ]; then printf '%s\n' "$n"; return 0; fi
+    if [ -n "$n" ]; then HL_SLOT="$n"; printf '%s\n' "$n"; return 0; fi
 
     # 3) первый свободный
     n2="$HL_SLOT_MIN"
@@ -237,7 +309,7 @@ hl_slot_for_port() {
     HL_MAP_PORT2SLOT["$port"]="$n2"
     HL_MAP_USED["$n2"]=1
     info "новый модем на порту $port -> слот $n2 (закреплено навсегда)"
-    printf '%s\n' "$n2"
+    HL_SLOT="$n2"; printf '%s\n' "$n2"
 }
 
 hl_port_for_slot() { awk -v n="$1" '$2==n{print $1; exit}' "$HL_SLOTS" 2>/dev/null; }
@@ -253,6 +325,40 @@ hl_slot_forget_port() {
 # Номер, переставший принадлежать порту. Помечаем, чтобы сборщик мусора
 # снял его правило и таблицу маршрутов, а не оставил перехватывать чужой трафик.
 hl_slot_mark_stale() { printf '%s\n' "$1" >>"$HL_RUN/stale-slots"; }
+
+# ----------------------------------------------------------- счётчики ------
+#
+# Любая грубая операция (перебор конфигураций, re-enumerate) обязана иметь
+# потолок и сбрасываться ТОЛЬКО при успехе. Иначе драйвер уходит в вечный
+# цикл: дёрнул, не помогло, дёрнул снова.
+
+_hl_cnt_file() { printf '%s/cnt.%s.%s' "$HL_VAR" "$1" "$(printf '%s' "$2" | tr '/:' '__')"; }
+
+hl_cnt_get()   { cat "$(_hl_cnt_file "$1" "$2")" 2>/dev/null || echo 0; }
+hl_cnt_bump()  { local n; n=$(( $(hl_cnt_get "$1" "$2") + 1 )); echo "$n" >"$(_hl_cnt_file "$1" "$2")"; echo "$n"; }
+hl_cnt_clear() { rm -f "$(_hl_cnt_file "$1" "$2")" 2>/dev/null; return 0; }
+
+# ------------------------------------------------------- карта устройств ---
+#
+# Порт -> IMEI. Заполняется, когда модем впервые вышел в сеть и ответил
+# по веб-API: до этого IMEI взять неоткуда, у HiLink в USB-дескрипторе
+# SerialNumber=0. Нужна для HL_IDENTITY=imei и просто для инвентаризации.
+
+HL_IMEI="$HL_VAR/imei"
+
+hl_imei_set() {
+    local port="$1" imei="$2" tmp
+    [ -n "$imei" ] || return 0
+    [ "$(awk -v p="$port" '$1==p{print $2; exit}' "$HL_IMEI" 2>/dev/null)" = "$imei" ] && return 0
+    tmp=$(mktemp "$HL_IMEI.XXXXXX" 2>/dev/null) || return 0
+    { awk -v p="$port" -v i="$imei" '$1!=p && $2!=i' "$HL_IMEI" 2>/dev/null
+      printf '%s %s\n' "$port" "$imei"; } >"$tmp" && mv -f "$tmp" "$HL_IMEI"
+    rm -f "$tmp" 2>/dev/null
+    return 0
+}
+
+hl_imei_get()       { awk -v p="$1" '$1==p{print $2; exit}' "$HL_IMEI" 2>/dev/null; }
+hl_imei_port()      { awk -v i="$1" '$2==i{print $1; exit}' "$HL_IMEI" 2>/dev/null; }
 
 hl_confmap_get() { awk -v k="$1" '$1==k{print $2; exit}' "$HL_CONFMAP" 2>/dev/null; }
 

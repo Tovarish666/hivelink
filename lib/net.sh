@@ -60,13 +60,7 @@ hl_addr_configure() {
         || { err "$iface: не задать default в таблице $table"; return 1; }
     ip route replace "$net.0/24" dev "$iface" src "$host" table "$table" 2>/dev/null
 
-    if [ -n "${HL_RULES_SNAPSHOT:-}" ]; then
-        hl_rule_exists "$host" "$table" \
-            || ip rule add from "$host" lookup "$table" pref "$((HL_TABLE_BASE + slot))" 2>/dev/null
-    else
-        ip rule list 2>/dev/null | grep -q "from $host lookup $table" \
-            || ip rule add from "$host" lookup "$table" pref "$((HL_TABLE_BASE + slot))" 2>/dev/null
-    fi
+    hl_rule_ensure "$slot" "$host" "$table"
 
     # Локальный маршрут в подсети модема, чтобы веб-морда была достижима
     ip route replace "$net.0/24" dev "$iface" src "$host" 2>/dev/null
@@ -135,6 +129,44 @@ hl_rule_exists() {
     esac
 }
 
+# Ровно одно правило на слот. Каждый hotplug раньше добавлял ещё одну
+# копию, и они накапливались сотнями: ядро проходит их по очереди,
+# а `ip rule list` превращается в простыню.
+hl_rule_ensure() {
+    local slot="$1" host="$2" table="$3" pref n
+    pref=$((HL_TABLE_BASE + slot))
+
+    n=$(ip rule list 2>/dev/null | grep -c "from $host lookup $table" || true)
+
+    if [ "$n" = 0 ]; then
+        ip rule add from "$host" lookup "$table" pref "$pref" 2>/dev/null
+        return 0
+    fi
+    while [ "$n" -gt 1 ] 2>/dev/null; do
+        ip rule del from "$host" lookup "$table" 2>/dev/null || break
+        n=$((n - 1))
+        dbg "слот $slot: снят дубль правила"
+    done
+    return 0
+}
+
+# Две разные железки, оказавшиеся в одной подсети, — верный признак того,
+# что модем не переопределился и остался на заводском адресе.
+# Обслуживаем первого, второго громко помечаем: чинится переопределением,
+# а не маршрутами.
+hl_subnet_conflict() {
+    local slot="$1" iface="$2" host other
+    host=$(hl_host "$slot")
+    other=$(ip -4 -o addr show 2>/dev/null | awk -v h="$host" -v i="$iface" \
+            '$4 ~ "^"h"/" && $2!=i {print $2; exit}')
+    if [ -n "$other" ]; then
+        err "слот $slot: адрес $host уже висит на $other — два модема в одной подсети;"
+        err "  скорее всего модем не переопределился с заводского адреса"
+        return 0
+    fi
+    return 1
+}
+
 # --------------------------------------------------------- защита DNS ------
 #
 # Известный косяк: модем раздаёт себя как DNS, что-нибудь на хосте это
@@ -155,12 +187,26 @@ hl_dns_hijacked() {
 
 hl_dns_guard() {
     [ "$HL_DNS_GUARD" = 1 ] || return 0
-    hl_dns_hijacked || return 0
 
-    err "резолвер угнан модемом: в /etc/resolv.conf прописан $HL_SUBNET_PREFIX.*"
+    # Пустой резолвер — такая же поломка, как угнанный: хост без DNS.
+    local empty=0
+    grep -q '^nameserver' /etc/resolv.conf 2>/dev/null || empty=1
+    [ "$empty" = 1 ] || hl_dns_hijacked || return 0
+
+    if [ "$empty" = 1 ]; then
+        err "в /etc/resolv.conf не осталось ни одного nameserver"
+    else
+        err "резолвер угнан модемом: в /etc/resolv.conf прописан $HL_SUBNET_PREFIX.*"
+    fi
+
+    # Источник правды: явная настройка, иначе снимок, снятый при установке
+    if [ -z "${HL_DNS_UPSTREAM:-}" ] && [ -s "$HL_VAR/resolv.upstream" ]; then
+        HL_DNS_UPSTREAM=$(tr '\n' ' ' <"$HL_VAR/resolv.upstream")
+        dbg "беру DNS из снимка: $HL_DNS_UPSTREAM"
+    fi
 
     if [ -z "${HL_DNS_UPSTREAM:-}" ]; then
-        warn "HL_DNS_UPSTREAM не задан в $HL_CONF — чинить нечем, только сообщаю"
+        warn "HL_DNS_UPSTREAM не задан и снимка нет — чинить нечем, только сообщаю"
         return 1
     fi
 
@@ -184,22 +230,51 @@ hl_networkd_dropin() {
     local f="$dir/10-hivelink-modems.network"
     cat >"$f" <<EOF
 # hivelink: модемные линки настраиваются нами вручную.
-# Главное здесь — UseDNS=no: не пускать DNS модема в системный резолвер.
+#
+# UseDNS=no + DNS= + DNSDefaultRoute=no — не пускать DNS модема
+#   в системный резолвер, иначе резолвинг всего хоста уедет в модем.
+# UseGateway/UseRoutes=no — иначе сорок default route дерутся с маршрутом
+#   хоста; наши маршруты живут только в своих таблицах.
+# RequiredForOnline=no — иначе загрузка ждёт готовности всех модемов.
 [Match]
 Name=${HL_IFACE_PREFIX}*
+Driver=rndis_host cdc_ether cdc_ncm huawei_cdc_ncm
+
+[Link]
+RequiredForOnline=no
 
 [Network]
 DHCP=no
 LinkLocalAddressing=no
 IPv6AcceptRA=no
+DNS=
+DNSDefaultRoute=no
 
 [DHCPv4]
 UseDNS=no
 UseNTP=no
 UseRoutes=no
+UseGateway=no
 UseDomains=no
 EOF
     dbg "networkd drop-in: $f"
+}
+
+# Снимок рабочего резолвера. Делается при установке, пока всё ещё цело,
+# и служит источником правды для стража DNS.
+hl_dns_snapshot() {
+    local f="$HL_VAR/resolv.upstream"
+    [ -s "$f" ] && return 0
+    hl_dns_hijacked && { warn "резолвер уже угнан — снимок не делаю"; return 1; }
+    awk '/^nameserver/{print $2}' /etc/resolv.conf 2>/dev/null \
+        | grep -v "^${HL_SUBNET_PREFIX}\." >"$f"
+    if [ -s "$f" ]; then
+        info "снимок резолвера: $(tr '\n' ' ' <"$f")"
+    else
+        rm -f "$f"
+        warn "в /etc/resolv.conf нет пригодных nameserver — задай HL_DNS_UPSTREAM вручную"
+        return 1
+    fi
 }
 
 # --------------------------------------------------------- проверка связи --

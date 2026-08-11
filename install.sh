@@ -104,6 +104,32 @@ say "параметры ядра"
 install -m 644 "$SRC/etc/sysctl.d/90-hivelink.conf" /etc/sysctl.d/90-hivelink.conf
 sysctl -q --system 2>/dev/null || true
 
+# Буфер usbfs: по умолчанию 16 МБ на всё ядро. Десятки модемов с крупными
+# RX-URB его исчерпывают, и submit падает — выглядит как случайные обрывы.
+say "буфер usbfs"
+echo "options usbcore usbfs_memory_mb=1024" >/etc/modprobe.d/hivelink-usbcore.conf
+if [ -w /sys/module/usbcore/parameters/usbfs_memory_mb ]; then
+    echo 1024 >/sys/module/usbcore/parameters/usbfs_memory_mb 2>/dev/null \
+        && say "  применено на живую: $(cat /sys/module/usbcore/parameters/usbfs_memory_mb) МБ"
+else
+    warn "  применится после перезагрузки (usbcore вкомпилирован в ядро)"
+fi
+
+# Снимок рабочего резолвера, пока он ещё цел — источник правды для стража DNS
+say "снимок резолвера"
+mkdir -p "$VAR"
+if grep -q '^nameserver' /etc/resolv.conf 2>/dev/null; then
+    awk '/^nameserver/{print $2}' /etc/resolv.conf | grep -v '^192\.168\.' >"$VAR/resolv.upstream" || true
+    if [ -s "$VAR/resolv.upstream" ]; then
+        say "  сохранено: $(tr '\n' ' ' <"$VAR/resolv.upstream")"
+    else
+        rm -f "$VAR/resolv.upstream"
+        warn "  все nameserver из 192.168.* — задай HL_DNS_UPSTREAM в конфиге вручную"
+    fi
+else
+    warn "  в /etc/resolv.conf нет nameserver — задай HL_DNS_UPSTREAM вручную"
+fi
+
 say "udev"
 install -m 644 "$SRC/etc/udev/70-hivelink.rules" /etc/udev/rules.d/70-hivelink.rules
 udevadm control --reload 2>/dev/null || true
