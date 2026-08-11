@@ -1,512 +1,302 @@
 #!/bin/bash
-# hivelink / common.sh — общая база: конфиг, лог, блокировки, состояние.
-# Подключается всеми остальными модулями:  . /opt/hivelink/lib/common.sh
+# =============================================================================
+#  e3372-driver — общая библиотека. Подключается всеми утилитами пакета.
+#  Ничего не делает при подключении, только определяет функции и настройки.
+# =============================================================================
+# shellcheck shell=bash disable=SC2034
 
-# shellcheck disable=SC2034
+E3372_VERSION="2.0.0"
 
-HL_LIB="${HL_LIB:-/opt/hivelink/lib}"
-HL_ETC="${HL_ETC:-/etc/hivelink}"
-HL_VAR="${HL_VAR:-/var/lib/hivelink}"
-HL_RUN="${HL_RUN:-/run/hivelink}"
-HL_CONF="$HL_ETC/hivelink.conf"
+# ---------------------------------------------------------------------------
+# Настройки по умолчанию. Переопределяются в /etc/e3372/e3372.conf
+# ---------------------------------------------------------------------------
+PREFER_DRIVER=rndis_host                          # целевой сетевой драйвер
+FALLBACK_DRIVERS="cdc_ether"                      # приемлемо, если целевого нет
+BAD_DRIVERS="huawei_cdc_ncm cdc_mbim cdc_ncm qmi_wwan"   # raw-IP, DHCP не работает
+HOST_PREFIX="192.168"                             # префикс подсетей модемов
+HOST_OCTET=100                                    # адрес, который модем даёт хосту
+GW_OCTET=1                                        # адрес самого модема
+RULE_PRIO_BASE=1000
+CFG_MAX_TRIES=8                                   # перебор USB-конфигураций
+ZEROCD_MAX_TRIES=3                                # попытки usb_modeswitch до re-enumerate
+NODRV_GRACE=3                                     # циклов ждать привязки драйвера
+DHCP_MAX_TRIES=10
+HILINK_EVERY=4                                    # раз в сколько циклов дёргать web-API
+HILINK_CONCURRENCY=8
+AUTO_DATASWITCH=1                                 # включать мобильные данные
+AUTO_RECONNECT=1                                  # переподнимать соединение
+RECONNECT_COOLDOWN=180                            # сек между попытками дозвона
+USB_AUTOSUSPEND_OFF=1
+DNS_FALLBACK="1.1.1.1 8.8.8.8"
+SKIP_SUBNET_COLLISION=1                           # не трогать модем, чья подсеть = сеть хоста
+QUIET_REPEAT=300                                  # сек: не спамить одинаковым сообщением
 
-# ------------------------------------------------------------- умолчания ----
-# Всё это перекрывается в /etc/hivelink/hivelink.conf
+[ -r /etc/e3372/e3372.conf ] && . /etc/e3372/e3372.conf
 
-HL_SUBNET_PREFIX="192.168"      # модем N живёт в $PREFIX.$N.0/24
-HL_HOST_OCTET=100               # адрес хоста в подсети модема
-HL_GW_OCTET=1                   # адрес модема (веб-морда HiLink)
-HL_TABLE_BASE=10000             # таблица policy routing = BASE + N
-HL_SLOT_MIN=2                   # диапазон номеров модемов (3-й октет подсети)
-HL_SLOT_MAX=254                 # 253 модема на префикс; больше — меняй HL_SUBNET_PREFIX
-HL_IFACE_PREFIX="mdm"           # имя интерфейса = mdm<N>
+RUN=/run/e3372
+VAR=/var/lib/e3372
+LOCKFILE="$RUN/.lock"
+mkdir -p "$RUN" "$VAR" 2>/dev/null
 
-# Жёсткая привязка «ключ:номер» через пробел, например "3-3:104 imei:86...:105".
-# Приоритет надо всем: нужна, когда номер уже зашит во внешние системы
-# (прокси, правила, выгрузки) и менять адрес нельзя.
-HL_SLOT_PIN=""
+# ---------------------------------------------------------------------------
+# Логирование. В journal под тегом e3372; на терминал — только если он есть.
+# log_once подавляет повтор одинаковых сообщений чаще QUIET_REPEAT секунд,
+# иначе при 40 модемах journal превращается в кашу.
+# ---------------------------------------------------------------------------
+TAG="${E3372_TAG:-e3372}"
+now() { date +%s; }
+log()  { logger -t "$TAG" -- "$*" 2>/dev/null; [ -t 2 ] && printf '%s\n' "$*" >&2; return 0; }
+warn() { log "WARN: $*"; }
 
-# Файл-карта «ключ -> номер», по строке на модем. То же, что HL_SLOT_PIN,
-# но для сотен записей: выгружается из твоей таблицы учёта.
-HL_SLOT_MAP="$HL_ETC/slots.map"
+log_once() {
+    local key ts last
+    key=$(printf '%s' "$*" | tr -c 'A-Za-z0-9' '_' | cut -c1-80)
+    ts=$(now); last=$(cat "$RUN/.msg.$key" 2>/dev/null || echo 0)
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    [ $(( ts - last )) -lt "$QUIET_REPEAT" ] && return 0
+    printf '%s\n' "$ts" > "$RUN/.msg.$key" 2>/dev/null
+    log "$@"
+}
 
-# 1 — модему, которого нет ни в карте, ни в разведке, выдаётся свободный номер.
-# 0 — НЕ выдавать ничего: неизвестный модем помечается unknown и остаётся
-#     без адреса. Правильный режим, когда номер несёт бизнес-смысл
-#     (связка с ICC, портом прокси, строкой в учёте) и выдумывать его нельзя.
-HL_AUTO_ASSIGN=1
+# ---------------------------------------------------------------------------
+# Состояние. /run — переживает цикл, но не перезагрузку (счётчики попыток).
+# /var/lib — переживает перезагрузку (выученная карта конфигураций).
+# ---------------------------------------------------------------------------
+st_get() { local v; v=$(cat "$RUN/$1" 2>/dev/null); case "$v" in ''|*[!0-9]*) printf '%s' "${2:-0}" ;; *) printf '%s' "$v" ;; esac; }
+st_set() { printf '%s\n' "$2" > "$RUN/$1" 2>/dev/null; return 0; }
+st_del() { rm -f "$RUN/$1" 2>/dev/null; return 0; }
 
-# Сколько циклов ждать ответа разведки, прежде чем выдавать номер самим.
-# До этого модем остаётся без адреса — так безопаснее: неверный адрес
-# гарантированно промахивается мимо подсети модема и запускает лестницу
-# восстановления против исправного устройства.
-HL_DISCOVER_TRIES=3
-
-HL_PREFER_DRIVER="auto"         # auto | rndis_host | cdc_ether | cdc_ncm
-HL_RX_URB_SIZE=16384            # обход бага rndis_host, 0 = штатное поведение
-HL_DNS_GUARD=1                  # не пускать DNS модема в системный резолвер
-HL_DHCP=0                       # 0 = статика на хосте, 1 = DHCP от модема
-
-HL_HILINK_ENABLE=1              # ходить в веб-API модема
-HL_HILINK_TIMEOUT=6
-HL_HILINK_DATASWITCH=1          # включать передачу данных, если выключена
-
-# ------------------------------------------------------------ не мешать ---
-# Границы вмешательства. Всё, что может изменить настройки самого модема
-# или глобальные параметры хоста, выключается одним переключателем.
-
-HL_PROVISION_LAN=1              # переопределять LAN модема, если подсеть занята
-HL_ADOPT_LAN=1                  # принимать подсеть, на которой модем уже стоит
-HL_SYSCTL_GLOBAL=1              # трогать общесистемные sysctl (arp_ignore и пр.)
-HL_RENAME_IFACE=1               # переименовывать интерфейс в mdm<N>
-
-HL_ZEROCD_TRIES=3               # попыток usb_modeswitch до re-enumerate
-HL_MODESWITCH_REQUIRED=1        # 1 = отсутствие usb_modeswitch это ОШИБКА
-
-HL_WATCHDOG_ENABLE=1
-HL_WATCHDOG_PING="1.1.1.1"      # что пинговать через модем для проверки живости
-HL_WATCHDOG_FAILS=3             # неудач подряд до эскалации
-HL_WATCHDOG_ESCALATE=1          # 1 = разрешить usb reset при глухом модеме
-
-# ------------------------------------------------------------- масштаб -----
-# Модемов может быть под три сотни. Структурная часть цикла дешёвая (только
-# sysfs и ip), а вот пинги и веб-API стоят секунд — поэтому они идут
-# параллельно и не на каждом цикле.
-
-HL_PARALLEL=auto                # число рабочих потоков; auto = nproc, максимум 32
-HL_HEALTH_INTERVAL=120          # как часто проверять живость каждого модема, сек
-HL_GC=1                         # убирать правила и маршруты исчезнувших слотов
-
-# Буфер usbfs на ядро. По умолчанию 16 МБ — при десятках модемов с крупными
-# RX-URB (см. фикс rndis_host) этого не хватает, и submit начинает падать.
-HL_USBFS_MB=1024
-
-# ----------------------------------------------------------- устойчивость --
-# Счётчики, без которых драйвер уходит в бесконечные циклы.
-
-HL_NODRV_GRACE=3                # циклов ждать привязку драйвера, прежде чем дёргать
-HL_CFG_MAX_TRIES=6              # потолок перебора USB-конфигураций на порт
-HL_REENUM_MAX=5                 # потолок принудительных re-enumerate на порт
-HL_CFG_PROBE=1                  # 1 = перебирать bConfigurationValue, если сеть не поднялась
-
-# --------------------------------------------------------- идентификация --
-# port — номер закреплён за физическим гнездом (по умолчанию; годится, когда
-#        «седьмое гнездо всегда седьмой модем»)
-# imei — номер следует за устройством при перетыкании в другое гнездо
-# Привязка по IMEI возможна только после первого успешного выхода в сеть:
-# до этого IMEI неоткуда взять, USB-дескриптор у HiLink отдаёт SerialNumber=0.
-HL_IDENTITY=port
-
-# Подсети, которые нельзя занимать: третьи октеты, уже используемые хостом.
-# Пустое значение = определить автоматически из таблицы маршрутов.
-# Без этого на хосте с LAN 192.168.1.0/24 модем со слотом 1 угнал бы шлюз.
-HL_SUBNET_AVOID=""
-
-HL_LOG_LEVEL=info               # debug | info | warn | error
-HL_LOG_STDERR=auto              # auto | 1 | 0  (auto: в tty пишем, иначе только journal)
-
-# Реестр устройств: "vid:pid  семейство  предпочтительный_драйвер"
-# Семейства: hilink (веб-API + DHCP от модема), ncm, ether, generic
-#
-# Драйвер здесь — СПРАВОЧНЫЙ, а не принудительный: если модем уже поднялся
-# на другом драйвере и работает, никто его не трогает. Значение используется
-# только когда сетевого интерфейса нет вовсе.
-#
-# Покрыты E3372h-153/-320/-607, E3372s-153, K5150/K5160 и родня.
-HL_REGISTRY_DEFAULT='
-12d1:14db hilink rndis_host
-12d1:14dc hilink cdc_ether
-12d1:14fe hilink cdc_ether
-12d1:155e hilink rndis_host
-12d1:1568 hilink rndis_host
-12d1:14ac hilink cdc_ether
-12d1:1442 hilink cdc_ether
-12d1:1506 ncm    cdc_ncm
-12d1:1509 ncm    cdc_ncm
-12d1:15ca ncm    cdc_ncm
-'
-# PID «установочного» Zero-CD режима — их надо переключать
-HL_ZEROCD_PIDS="1f01 1f02 1f10 1f11 1f12 1f13 1f14 1440"
-# Вендоры, которые вообще рассматриваем как модемы
-HL_VENDORS="12d1"
-
-[ -r "$HL_CONF" ] && . "$HL_CONF"
-
-HL_REGISTRY="${HL_REGISTRY:-$HL_REGISTRY_DEFAULT}"
-
-# ------------------------------------------------------------------- лог ----
-
-# Логгер зовётся по несколько раз на каждый модем. При двух сотнях модемов
-# любая подоболочка или проверка внешней команды внутри него превращается
-# в тысячи запусков процессов, поэтому всё решается заранее и один раз.
-
-case "$HL_LOG_LEVEL" in
-    debug) _HL_LVL=10 ;; warn) _HL_LVL=30 ;; error) _HL_LVL=40 ;; *) _HL_LVL=20 ;;
-esac
-
-if command -v systemd-cat >/dev/null 2>&1; then _HL_CAT=1; else _HL_CAT=0; fi
-
-case "$HL_LOG_STDERR" in
-    1) _HL_ERR=1 ;;
-    0) _HL_ERR=0 ;;
-    *) if [ -t 2 ]; then _HL_ERR=1; else _HL_ERR=0; fi ;;
-esac
-
-log() {
-    local lvl="$1"; shift
-    local num pri c
-    case "$lvl" in
-        debug) num=10; pri=7; c='\033[90m' ;;
-        info)  num=20; pri=6; c='\033[36m' ;;
-        warn)  num=30; pri=4; c='\033[33m' ;;
-        error) num=40; pri=3; c='\033[31m' ;;
-        *)     num=20; pri=6; c='' ;;
-    esac
-    [ "$num" -ge "$_HL_LVL" ] || return 0
-
-    [ "$_HL_CAT" = 1 ] && printf '%s\n' "$*" | systemd-cat -t hivelink -p "$pri" 2>/dev/null
-    [ "$_HL_ERR" = 1 ] && printf "${c}%-5s\033[0m %s\n" "$lvl" "$*" >&2
+# Выученная карта "модель -> номер USB-конфигурации, дающей целевой драйвер".
+# Ключ — idProduct:bcdDevice, чтобы разные ревизии прошивки не смешивались.
+map_get() { [ -r "$VAR/confmap" ] && awk -v k="$1" '$1==k{print $2; exit}' "$VAR/confmap" 2>/dev/null; return 0; }
+map_set() {
+    local k="$1" v="$2" tmp
+    [ "$(map_get "$k")" = "$v" ] && return 0
+    tmp=$(mktemp "$VAR/.confmap.XXXXXX" 2>/dev/null) || return 0
+    { [ -r "$VAR/confmap" ] && grep -v "^$k " "$VAR/confmap" 2>/dev/null
+      printf '%s %s\n' "$k" "$v"; } > "$tmp" 2>/dev/null
+    mv -f "$tmp" "$VAR/confmap" 2>/dev/null
     return 0
 }
 
-dbg()  { log debug "$@"; }
-info() { log info  "$@"; }
-warn() { log warn  "$@"; }
-err()  { log error "$@"; }
-die()  { log error "$@"; exit 1; }
+# ---------------------------------------------------------------------------
+# Классификация Huawei PID по режиму устройства.
+# Источник — INF из оригинального пакета HUAWEI Drivers 5.05.01.158:
+#   cdrom        FcSwitch.inf          mass storage / Zero-CD, ждёт переключения
+#                                      1f10..1f14 = ветка Vodafone (K5150/K5160)
+#   hilink       ewqsnet.inf           RNDIS/ECM — рабочий режим
+#   stick        ew_usbenumfilter.inf  composite stick, НЕ HiLink
+#   stick-serial ew_hwusbdev*.inf      стик в serial-режиме, НЕ HiLink
+# Пакет 2014 г.: PID поздних ревизий (E3372h-320) сюда не входят -> other.
+# other не считается ошибкой — устройство просто проверяется по драйверу.
+# ---------------------------------------------------------------------------
+pid_mode() {
+    case "${1,,}" in
+        1f01|1f02|1f10|1f11|1f12|1f13|1f14|1440)
+            echo cdrom ;;
+        1400|1441|14bb|14bc|14bd|14be|14d[7-9a-f]|14e[0-9a-f]|14f[6-9a]|14fd|1565|1566|157[5-9ab]|157f|159[0-2])
+            echo hilink ;;
+        150[6-9a-f]|14c[6-9a-f]|151[b-f]|156[b-f]|158[5-9]|159[3-68ace]|15a[02468a]|15b[0-9a]|15d[1-9a-f]|15e[0-3]|15fd|1c2[5-9a])
+            echo stick ;;
+        1446|1449|14fe|14ff|1505|151a|156a|15ab|15ac|15ad|15ae|15af|15[2-4][0-9a-f]|155[0-9ab]|15c[a-f]|1c0b|1c1b|1c24)
+            echo stick-serial ;;
+        *)  echo other ;;
+    esac
+}
 
-# ------------------------------------------------------- жёсткие зависимости --
-#
-# Главный урок старого стека: пропавший usb_modeswitch молча выключал целую
-# стадию, и это маскировалось месяцами. Здесь отсутствие обязательной утилиты
-# либо валит цикл, либо громко орёт — но никогда не «return 0».
+# PID «установочного» (Zero-CD) режима — для usb_modeswitch-конфигов.
+ZEROCD_PIDS="1f01 1f02 1f10 1f11 1f12 1f13 1f14 1440"
 
-require() {
-    local bin="$1" pkg="${2:-$1}" hard="${3:-1}"
-    if command -v "$bin" >/dev/null 2>&1; then return 0; fi
-    if [ "$hard" = 1 ]; then
-        die "нет обязательной утилиты '$bin' (apt install $pkg) — стадия не может работать"
-    fi
-    warn "нет утилиты '$bin' (apt install $pkg) — функциональность урезана"
+# ---------------------------------------------------------------------------
+# USB
+# ---------------------------------------------------------------------------
+# Все USB-устройства Huawei (именно устройства, не интерфейсы).
+usb_devs() {
+    local d
+    for d in /sys/bus/usb/devices/*; do
+        [ -r "$d/idVendor" ] || continue
+        [ "$(cat "$d/idVendor" 2>/dev/null)" = "12d1" ] || continue
+        case "${d##*/}" in *:*) continue ;; esac
+        printf '%s\n' "$d"
+    done
+    return 0
+}
+
+dev_port() { printf '%s' "${1##*/}"; }
+dev_attr() { cat "$1/$2" 2>/dev/null; return 0; }
+
+# Драйверы, привязанные к интерфейсам устройства.
+dev_drivers() {
+    local i drv
+    for i in "$1":*; do
+        [ -e "$i/driver" ] || continue
+        drv=$(basename "$(readlink -f "$i/driver" 2>/dev/null)" 2>/dev/null)
+        [ -n "$drv" ] && printf '%s\n' "$drv"
+    done
+    return 0
+}
+
+is_ok_driver()  { case " $PREFER_DRIVER $FALLBACK_DRIVERS " in *" $1 "*) return 0 ;; esac; return 1; }
+is_bad_driver() { case " $BAD_DRIVERS " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# Сетевой драйвер устройства: печатает первый известный, пусто если ни одного.
+dev_net_driver() {
+    local drv
+    while read -r drv; do
+        if is_ok_driver "$drv" || is_bad_driver "$drv"; then printf '%s' "$drv"; return 0; fi
+    done < <(dev_drivers "$1")
     return 1
 }
 
-# ------------------------------------------------------------- блокировки ---
+iface_driver() { basename "$(readlink -f "/sys/class/net/$1/device/driver" 2>/dev/null)" 2>/dev/null; return 0; }
 
-hl_lock() {
-    local name="${1:-global}" fd
-    mkdir -p "$HL_RUN"
-
-    # Без flock блокировки не будет. Это деградация, а не повод молча выйти:
-    # цикл всё равно должен отработать, но пользователь обязан узнать почему.
-    if ! command -v flock >/dev/null 2>&1; then
-        err "нет flock (apt install util-linux) — работаю БЕЗ блокировки;"
-        err "при одновременном запуске возможны гонки за маршруты"
-        return 0
-    fi
-
-    exec {fd}>"$HL_RUN/$name.lock" || die "не открыть лок $name"
-    if ! flock -w "${2:-60}" "$fd"; then
-        warn "лок '$name' занят дольше ${2:-60}с — выхожу, отработает следующий цикл"
-        exit 0
-    fi
-    eval "HL_LOCK_FD_$name=$fd"
+# Путь USB-устройства для сетевого интерфейса (стабильный идентификатор гнезда).
+iface_usb_port() {
+    local dl
+    dl=$(readlink -f "/sys/class/net/$1/device" 2>/dev/null) || return 1
+    [ -n "$dl" ] || return 1
+    printf '%s' "$(basename "$(dirname "$dl")")"
 }
 
-# ------------------------------------------------------------- состояние ----
-#
-# slots   : usb-путь -> номер модема N        (лечит сдвиг портов)
-# confmap : idProduct:bcdDevice -> драйвер    (кэш перебора конфигураций)
-
-HL_SLOTS="$HL_VAR/slots"
-HL_CONFMAP="$HL_VAR/confmap"
-
-declare -A HL_MAP_PORT2SLOT=()   # usb-путь -> номер
-declare -A HL_MAP_USED=()        # номер -> занят
-
-hl_state_init() {
-    mkdir -p "$HL_VAR" "$HL_RUN"
-    [ -f "$HL_SLOTS" ]   || : >"$HL_SLOTS"
-    [ -f "$HL_CONFMAP" ] || : >"$HL_CONFMAP"
-    hl_slots_load
-}
-
-# Карта грузится в память один раз за цикл. При 200 модемах любой поиск
-# через awk или grep превращается в тысячи запусков процессов, поэтому
-# вся работа с номерами идёт по ассоциативным массивам.
-hl_slots_load() {
-    local p n pin line
-    HL_MAP_PORT2SLOT=(); HL_MAP_USED=()
-
-    # Карта из файла — то же, что HL_SLOT_PIN, но для сотен записей.
-    # Выгружается из твоей таблицы учёта, где номер несёт бизнес-смысл.
-    if [ -r "${HL_SLOT_MAP:-}" ]; then
-        while read -r line; do
-            case "$line" in ''|'#'*) continue ;; esac
-            HL_SLOT_PIN="$HL_SLOT_PIN $(printf '%s' "$line" | awk '{print $1":"$2}')"
-        done <"$HL_SLOT_MAP"
-    fi
-    while read -r p n; do
-        [ -n "${p:-}" ] && [ -n "${n:-}" ] || continue
-        HL_MAP_PORT2SLOT["$p"]="$n"
-        HL_MAP_USED["$n"]=1
-    done <"$HL_SLOTS"
-    # Закреплённые в конфиге номера тоже заняты, иначе автовыдача
-    # наступит на пин и два модема получат один адрес.
-    for pin in $HL_SLOT_PIN; do
-        [ -n "$pin" ] && HL_MAP_USED["${pin#*:}"]=1
-    done
-    # Подсети, занятые самим хостом, тоже вне игры.
-    for n in $(hl_subnets_in_use); do HL_MAP_USED["$n"]=1; done
-}
-
-# Третьи октеты, которые уже заняты на хосте в нашем префиксе.
-# Классический выстрел в ногу: LAN сервера 192.168.1.0/24, модем получает
-# слот 1 и уводит на себя весь трафик к шлюзу.
-hl_subnets_in_use() {
-    if [ -n "$HL_SUBNET_AVOID" ]; then
-        printf '%s\n' "$HL_SUBNET_AVOID" | tr ' ,' '\n\n'
-        return 0
-    fi
-    local p1="${HL_SUBNET_PREFIX%%.*}" p2="${HL_SUBNET_PREFIX##*.}"
-    {   ip -4 route show 2>/dev/null | awk '{print $1}'
-        ip -4 addr show 2>/dev/null | awk '/inet /{print $2}'
-    } | awk -F'[./]' -v a="$p1" -v b="$p2" '$1==a && $2==b {print $3}' | sort -un
-}
-
-# Номер модема по USB-пути. Привязка вечная: тот же физический порт —
-# всегда тот же N, независимо от порядка появления и от того, кто поднялся первым.
-#
-# Порядок разрешения:
-#   1) HL_SLOT_PIN из конфига — декларативно, переживает потерю состояния
-#   2) ранее выданный номер из карты слотов
-#   3) первый свободный номер, с записью в карту
-#
-# ВАЖНО: результат кладётся в глобальную HL_SLOT, а не только печатается.
-# Вызов через $(...) породил бы подоболочку, обновления карты в памяти
-# до родителя не дожили бы, и все модемы одного цикла получили бы один
-# и тот же номер. Правильный вызов:
-#     hl_slot_for_port "$port" >/dev/null || continue
-#     slot="$HL_SLOT"
-HL_SLOT=""
-
-hl_slot_for_port() {
-    local port="$1" n pin old n2 imei
-
-    # 0) пин по IMEI — единственная форма, переносимая между серверами:
-    #    USB-путь у каждого хоста свой, а IMEI живёт в самом модеме.
-    #    Работает со второго цикла: IMEI узнаётся только через веб-API.
-    imei=$(hl_imei_get "$port")
-    if [ -n "$imei" ]; then
-        for pin in $HL_SLOT_PIN; do
-            case "$pin" in
-                "imei:$imei:"*)
-                    n="${pin##*:}"
-                    old="${HL_MAP_PORT2SLOT[$port]:-}"
-                    if [ -n "$old" ] && [ "$old" != "$n" ]; then
-                        info "IMEI $imei переехал: слот $old -> $n"
-                        hl_slot_forget_port "$port"; hl_slot_mark_stale "$old"
-                        unset "HL_MAP_PORT2SLOT[$port]" "HL_MAP_USED[$old]"
-                    fi
-                    HL_MAP_PORT2SLOT["$port"]="$n"; HL_MAP_USED["$n"]=1
-                    HL_SLOT="$n"; printf '%s\n' "$n"; return 0 ;;
-            esac
-        done
-    fi
-
-    # 1) пин по USB-порту
-    for pin in $HL_SLOT_PIN; do
-        case "$pin" in
-            "$port":*)
-                n="${pin#*:}"
-                # В карте мог остаться старый автономер этого же порта.
-                # Если его не снять, он навечно займёт номер, который никому
-                # уже не принадлежит, и следующий модем получит не тот адрес.
-                old="${HL_MAP_PORT2SLOT[$port]:-}"
-                if [ -n "$old" ] && [ "$old" != "$n" ]; then
-                    warn "порт $port: пин $n перекрывает выданный ранее $old — снимаю старую запись"
-                    hl_slot_forget_port "$port"
-                    hl_slot_mark_stale "$old"
-                    unset "HL_MAP_PORT2SLOT[$port]" "HL_MAP_USED[$old]"
-                fi
-                HL_MAP_PORT2SLOT["$port"]="$n"; HL_MAP_USED["$n"]=1
-                HL_SLOT="$n"; printf '%s\n' "$n"; return 0 ;;
-        esac
-    done
-
-    # 2) РАЗВЕДКА. Модем сам сообщил, в какой он подсети — это факт,
-    #    и он важнее всего, что мы могли выдумать на прошлых циклах.
-    #    Раньше эта проверка стояла ПОСЛЕ карты слотов и потому не срабатывала
-    #    никогда: карта, заполненная автовыдачей, побеждала разведку.
-    n=$(hl_lanhint_get "$port")
-    if [ -n "$n" ]; then
-        old="${HL_MAP_PORT2SLOT[$port]:-}"
-        if [ -n "$old" ] && [ "$old" != "$n" ]; then
-            warn "порт $port: модем реально в подсети $n, а в карте стояло $old — исправляю"
-            hl_slot_forget_port "$port"
-            hl_slot_mark_stale "$old"
-            unset "HL_MAP_PORT2SLOT[$port]" "HL_MAP_USED[$old]"
-        fi
-        if [ -z "${HL_MAP_PORT2SLOT[$port]:-}" ]; then
-            printf '%s %s\n' "$port" "$n" >>"$HL_SLOTS"
-            HL_MAP_PORT2SLOT["$port"]="$n"; HL_MAP_USED["$n"]=1
-            info "порт $port: принят номер модема $n"
-        fi
-        HL_SLOT="$n"; printf '%s\n' "$n"; return 0
-    fi
-
-    # 3) ранее выданный
-    n="${HL_MAP_PORT2SLOT[$port]:-}"
-    if [ -n "$n" ]; then HL_SLOT="$n"; printf '%s\n' "$n"; return 0; fi
-
-    # 4) разведка ещё не отработала — НИЧЕГО не выдаём.
-    #    Выдумать номер и повесить адрес значит гарантированно промахнуться
-    #    мимо подсети модема, а дальше лестница восстановления начнёт
-    #    сносить исправное устройство.
-    local tries
-    tries=$(hl_cnt_get discover "$port")
-    if [ "$tries" -lt "${HL_DISCOVER_TRIES:-3}" ]; then
-        hl_cnt_bump discover "$port" >/dev/null
-        info "порт $port: номер пока неизвестен, жду разведку ($((tries + 1))/${HL_DISCOVER_TRIES:-3})"
-        HL_SLOT=""; return 1
-    fi
-
-    if [ "${HL_AUTO_ASSIGN:-1}" != 1 ]; then
-        warn "порт $port: разведка молчит, автовыдача выключена — модем остаётся без номера"
-        HL_SLOT=""; return 1
-    fi
-
-    # 3) первый свободный
-    n2="$HL_SLOT_MIN"
-    while [ "$n2" -le "$HL_SLOT_MAX" ]; do
-        [ -z "${HL_MAP_USED[$n2]:-}" ] && break
-        n2=$((n2 + 1))
-    done
-    [ "$n2" -le "$HL_SLOT_MAX" ] || {
-        err "кончились номера ($HL_SLOT_MIN..$HL_SLOT_MAX), это потолок в $((HL_SLOT_MAX - HL_SLOT_MIN + 1)) модемов на префикс $HL_SUBNET_PREFIX"
-        return 1
-    }
-
-    printf '%s %s\n' "$port" "$n2" >>"$HL_SLOTS"
-    HL_MAP_PORT2SLOT["$port"]="$n2"
-    HL_MAP_USED["$n2"]=1
-    info "новый модем на порту $port -> слот $n2 (закреплено навсегда)"
-    HL_SLOT="$n2"; printf '%s\n' "$n2"
-}
-
-hl_port_for_slot() { awk -v n="$1" '$2==n{print $1; exit}' "$HL_SLOTS" 2>/dev/null; }
-
-hl_slot_forget_port() {
-    local port="$1" tmp
-    tmp=$(mktemp "$HL_SLOTS.XXXXXX" 2>/dev/null) || return 0
-    awk -v p="$port" '$1!=p' "$HL_SLOTS" 2>/dev/null >"$tmp" && mv -f "$tmp" "$HL_SLOTS"
-    rm -f "$tmp" 2>/dev/null
+# Смена USB-конфигурации. Прямая запись обычно проходит (ядро само отвязывает
+# драйверы); если занято — сначала расконфигурировать (-1), потом поставить.
+set_config() {
+    local d="$1" v="$2"
+    printf '%s\n' "$v" > "$d/bConfigurationValue" 2>/dev/null && return 0
+    printf '%s\n' "-1" > "$d/bConfigurationValue" 2>/dev/null
+    sleep 1
+    printf '%s\n' "$v" > "$d/bConfigurationValue" 2>/dev/null
     return 0
 }
 
-# Номер, переставший принадлежать порту. Помечаем, чтобы сборщик мусора
-# снял его правило и таблицу маршрутов, а не оставил перехватывать чужой трафик.
-hl_slot_mark_stale() { printf '%s\n' "$1" >>"$HL_RUN/stale-slots"; }
-
-# ----------------------------------------------------------- счётчики ------
-#
-# Любая грубая операция (перебор конфигураций, re-enumerate) обязана иметь
-# потолок и сбрасываться ТОЛЬКО при успехе. Иначе драйвер уходит в вечный
-# цикл: дёрнул, не помогло, дёрнул снова.
-
-_hl_cnt_file() { printf '%s/cnt.%s.%s' "$HL_VAR" "$1" "$(printf '%s' "$2" | tr '/:' '__')"; }
-
-hl_cnt_get()   { cat "$(_hl_cnt_file "$1" "$2")" 2>/dev/null || echo 0; }
-hl_cnt_bump()  { local n; n=$(( $(hl_cnt_get "$1" "$2") + 1 )); echo "$n" >"$(_hl_cnt_file "$1" "$2")"; echo "$n"; }
-hl_cnt_clear() { rm -f "$(_hl_cnt_file "$1" "$2")" 2>/dev/null; return 0; }
-
-# ------------------------------------------------------- карта устройств ---
-#
-# Порт -> IMEI. Заполняется, когда модем впервые вышел в сеть и ответил
-# по веб-API: до этого IMEI взять неоткуда, у HiLink в USB-дескрипторе
-# SerialNumber=0. Нужна для HL_IDENTITY=imei и просто для инвентаризации.
-
-HL_IMEI="$HL_VAR/imei"
-
-hl_imei_set() {
-    local port="$1" imei="$2" tmp
-    [ -n "$imei" ] || return 0
-    [ "$(awk -v p="$port" '$1==p{print $2; exit}' "$HL_IMEI" 2>/dev/null)" = "$imei" ] && return 0
-    tmp=$(mktemp "$HL_IMEI.XXXXXX" 2>/dev/null) || return 0
-    { awk -v p="$port" -v i="$imei" '$1!=p && $2!=i' "$HL_IMEI" 2>/dev/null
-      printf '%s %s\n' "$port" "$imei"; } >"$tmp" && mv -f "$tmp" "$HL_IMEI"
-    rm -f "$tmp" 2>/dev/null
+# Принудительное пере-enumeration: аналог CM_Reenumerate_DevNode в виндовом стеке.
+usb_reenumerate() {
+    local d="$1"
+    [ -w "$d/authorized" ] || return 1
+    printf '0\n' > "$d/authorized" 2>/dev/null
+    sleep 2
+    printf '1\n' > "$d/authorized" 2>/dev/null
     return 0
 }
 
-hl_imei_get()       { awk -v p="$1" '$1==p{print $2; exit}' "$HL_IMEI" 2>/dev/null; }
-hl_imei_port()      { awk -v i="$1" '$2==i{print $1; exit}' "$HL_IMEI" 2>/dev/null; }
-
-# ------------------------------------------------- подсказка по подсети ----
-#
-# Модем уже настроен на какую-то подсеть — своим прошлым владельцем,
-# старым стеком или вручную. Разведка (DHCP) выясняет её в рабочем потоке,
-# а следующий цикл принимает этот номер вместо того, чтобы навязывать свой.
-# Так hivelink подхватывает готовую ферму, ничего не переселяя.
-
-HL_LANHINT="$HL_VAR/lanhint"
-
-hl_lanhint_set() {
-    local port="$1" n="$2" tmp
-    [ -n "$n" ] || return 0
-    [ "$(awk -v p="$port" '$1==p{print $2; exit}' "$HL_LANHINT" 2>/dev/null)" = "$n" ] && return 0
-    tmp=$(mktemp "$HL_LANHINT.XXXXXX" 2>/dev/null) || return 0
-    { awk -v p="$port" '$1!=p' "$HL_LANHINT" 2>/dev/null
-      printf '%s %s\n' "$port" "$n"; } >"$tmp" && mv -f "$tmp" "$HL_LANHINT"
-    rm -f "$tmp" 2>/dev/null
+# ---------------------------------------------------------------------------
+# Сеть
+# ---------------------------------------------------------------------------
+# Интерфейсы модемов с выданным адресом: "iface ip"
+modem_ips() {
+    ip -4 -o addr show 2>/dev/null | awk -v p="$HOST_PREFIX" -v o="$HOST_OCTET" '
+        { split($4, a, "/"); split(a[1], b, ".")
+          if (b[1] "." b[2] == p && b[4] == o) print $2, a[1] }'
     return 0
 }
 
-hl_lanhint_get() { awk -v p="$1" '$1==p{print $2; exit}' "$HL_LANHINT" 2>/dev/null; }
+# Номер таблицы маршрутизации. 253/254/255 зарезервированы (default/main/local),
+# 0 недопустим — такие N уводим в отдельный диапазон, иначе снесём таблицы ядра.
+table_for() {
+    local n="$1"
+    if [ "$n" -ge 1 ] 2>/dev/null && [ "$n" -le 252 ] 2>/dev/null
+    then printf '%s' "$n"
+    else printf '%s' $(( 10000 + n )); fi
+}
 
-hl_confmap_get() { awk -v k="$1" '$1==k{print $2; exit}' "$HL_CONFMAP" 2>/dev/null; }
+# Подсеть модема пересекается с адресом на другом интерфейсе (сеть хоста)?
+subnet_busy() {
+    ip -4 -o addr show 2>/dev/null | awk -v pat="$HOST_PREFIX.$1." -v me="$2" \
+        '$2 != me && index($4, pat) == 1 { f = 1 } END { exit !f }'
+}
 
-# Пишется из параллельных рабочих потоков, поэтому под собственным локом:
-# без него read-modify-write двух потоков затрёт друг друга.
-# Нет flock — пишем без него: потерять запись кэша не страшно,
-# а вот молча не писать вообще — это уже скрытый отказ.
-hl_confmap_set() {
-    local k="$1" v="$2" tmp lfd locked=0
-    # НЕ "$HL_CONFMAP.$$": в фоновом процессе bash подставляет PID родителя,
-    # и все параллельные потоки получат одно и то же имя файла.
-    tmp=$(mktemp "$HL_CONFMAP.XXXXXX" 2>/dev/null) || return 0
+# Идемпотентная установка ip rule: дубликаты не копятся.
+rule_ensure() {
+    local ip="$1" tbl="$2" prio="$3" i=0
+    ip rule show 2>/dev/null | grep -q "from $ip lookup $tbl" && return 0
+    while [ "$i" -lt 5 ]; do ip rule del from "$ip/32" 2>/dev/null || break; i=$(( i + 1 )); done
+    ip rule add from "$ip/32" table "$tbl" priority "$prio" 2>/dev/null
+    return 0
+}
 
-    if command -v flock >/dev/null 2>&1; then
-        if exec {lfd}>"$HL_RUN/confmap.lock" 2>/dev/null; then
-            flock -w 5 "$lfd" 2>/dev/null && locked=1
+# ---------------------------------------------------------------------------
+# HiLink web-API. Прошивки этого поколения требуют сессию:
+#   GET /api/webserver/SesTokInfo -> Cookie: SessionID=... + __RequestVerificationToken
+# Без них любой запрос отдаёт <error><code>125002</code>.
+# ---------------------------------------------------------------------------
+xmlval() { tr -d '\r\n' | sed -n "s:.*<$1>\([^<]*\)</$1>.*:\1:p"; }
+
+hl_session() {                    # gw -> "SID|TOK"
+    local s sid tok
+    s=$(curl -s -m4 "http://$1/api/webserver/SesTokInfo" 2>/dev/null) || return 1
+    sid=$(printf '%s' "$s" | xmlval SesInfo)
+    tok=$(printf '%s' "$s" | xmlval TokInfo)
+    [ -n "$sid" ] || return 1
+    printf '%s|%s' "$sid" "$tok"
+}
+
+hl_get()  {                       # gw sid tok path
+    curl -s -m5 -H "Cookie: $2" -H "__RequestVerificationToken: $3" "http://$1$4" 2>/dev/null
+    return 0
+}
+
+hl_post() {                       # gw sid tok path body
+    curl -s -m8 -X POST -H "Cookie: $2" -H "__RequestVerificationToken: $3" \
+         -H 'Content-Type: application/xml; charset=UTF-8' -d "$5" "http://$1$4" 2>/dev/null
+    return 0
+}
+
+conn_text() {
+    case "$1" in
+        901) echo онлайн ;;      900) echo коннектит ;;   902) echo отключён ;;
+        903) echo отключается ;; 904) echo сбой ;;        905) echo сбой-сети ;;
+        906) echo сбой-роуминг ;; 907) echo нет-сети ;;
+        11[2-5]) echo нет-регистрации ;;
+        '')  echo нет-ответа ;;  *) echo "$1" ;;
+    esac
+}
+
+net_text() {
+    case "$1" in
+        0) echo нет ;; 1|2|3) echo 2G ;; 4|5|6|7|8|9) echo 3G ;;
+        4[1-6]|10[1-9]|11[0-9]) echo 3G+ ;; 19|101) echo LTE ;;
+        '') echo ? ;; *) echo "$1" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Обработка одного модема через web-API. Вызывается параллельно через xargs,
+# поэтому не должна ничего писать в общее состояние кроме своих ключей.
+# ---------------------------------------------------------------------------
+modem_worker() {
+    local iface="$1" ip="$2" n gw ses sid tok st cs sw last ts
+    n=$(printf '%s' "$ip" | cut -d. -f3)
+    gw="$HOST_PREFIX.$n.$GW_OCTET"
+
+    ses=$(hl_session "$gw") || { log_once "N=$n: web-API не отвечает"; return 0; }
+    sid=${ses%%|*}; tok=${ses##*|}
+
+    # 1. мобильные данные выключены -> включить (это и есть «сеть нашёл,
+    #    но не подключился»: модем зарегистрирован, передача данных выключена)
+    if [ "${AUTO_DATASWITCH:-1}" = 1 ]; then
+        sw=$(hl_get "$gw" "$sid" "$tok" /api/dialup/mobile-dataswitch | xmlval dataswitch)
+        if [ "$sw" = "0" ]; then
+            log "N=$n: мобильные данные выключены — включаю"
+            hl_post "$gw" "$sid" "$tok" /api/dialup/mobile-dataswitch \
+                '<?xml version="1.0" encoding="UTF-8"?><request><dataswitch>1</dataswitch></request>' >/dev/null
+            return 0
         fi
     fi
 
-    { awk -v k="$k" '$1!=k' "$HL_CONFMAP" 2>/dev/null
-      printf '%s %s\n' "$k" "$v"; } >"$tmp" && mv -f "$tmp" "$HL_CONFMAP"
-    rm -f "$tmp" 2>/dev/null
-
-    [ "$locked" = 1 ] && exec {lfd}>&-
+    # 2. данные включены, но соединения нет -> дозвон, с выдержкой
+    st=$(hl_get "$gw" "$sid" "$tok" /api/monitoring/status)
+    cs=$(printf '%s' "$st" | xmlval ConnectionStatus)
+    case "$cs" in
+        901|900|903) st_del "dial.$n"; return 0 ;;
+        '')          log_once "N=$n: статус не читается (сессия/прошивка)"; return 0 ;;
+        90[7]|11[2-5]) log_once "N=$n: нет регистрации в сети (SIM/сигнал/APN)"; return 0 ;;
+    esac
+    [ "${AUTO_RECONNECT:-1}" = 1 ] || return 0
+    ts=$(now); last=$(st_get "dial.$n" 0)
+    [ $(( ts - last )) -lt "$RECONNECT_COOLDOWN" ] && return 0
+    st_set "dial.$n" "$ts"
+    log "N=$n: ConnectionStatus=$cs ($(conn_text "$cs")) — дозваниваюсь"
+    hl_post "$gw" "$sid" "$tok" /api/dialup/dial \
+        '<?xml version="1.0" encoding="UTF-8"?><request><Action>1</Action></request>' >/dev/null
     return 0
 }
-
-# Число рабочих потоков: столько ядер, сколько есть, но не больше 32 —
-# упираемся не в CPU, а в таймауты пингов и веб-API.
-hl_parallelism() {
-    local p="${HL_PARALLEL:-auto}"
-    if [ "$p" = auto ]; then
-        p=$(nproc 2>/dev/null || echo 4)
-        p=$((p * 2))
-    fi
-    [ "$p" -lt 1 ] 2>/dev/null && p=1
-    [ "$p" -gt 32 ] 2>/dev/null && p=32
-    printf '%s\n' "$p"
-}
-
-# ---------------------------------------------------------------- адреса ----
-
-hl_net()  { printf '%s.%s'    "$HL_SUBNET_PREFIX" "$1"; }               # 192.168.N
-hl_host() { printf '%s.%s.%s' "$HL_SUBNET_PREFIX" "$1" "$HL_HOST_OCTET"; }
-hl_gw()   { printf '%s.%s.%s' "$HL_SUBNET_PREFIX" "$1" "$HL_GW_OCTET"; }
-hl_table(){ printf '%s' "$((HL_TABLE_BASE + $1))"; }
-hl_iface(){ printf '%s%s' "$HL_IFACE_PREFIX" "$1"; }

@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  e3372-reconcile — «драйвер» парка модемов Huawei E3372 / K5160.
+#
+#  Один проход приведения системы к рабочему состоянию. Идемпотентен: гоняется
+#  и по таймеру, и по udev-событию, и вручную — результат один и тот же.
+#  Намеренно БЕЗ `set -e`: любой сбойный шаг не должен ронять остальные.
+# =============================================================================
+set -uo pipefail
+
+# shellcheck source=../lib/common.sh
+. /usr/local/lib/e3372/common.sh
+
+# Параллельный воркер web-API вызывает сам себя же с этим флагом.
+if [ "${1:-}" = "--modem" ]; then
+    shift
+    modem_worker "${1:-}" "${2:-}"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Один экземпляр за раз. udev при включении 40 модемов присылает сотни событий;
+# без блокировки они наложатся друг на друга и передерутся за bConfigurationValue.
+# ---------------------------------------------------------------------------
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+    exit 0
+fi
+trap 'flock -u 9 2>/dev/null' EXIT
+
+CYCLE=$(st_get cycle 0)
+st_set cycle $(( (CYCLE + 1) % 100000 ))
+
+# ---------------------------------------------------------------------------
+# 1. Питание USB. Автосуспенд усыпляет модемы и хабы; проснувшись, часть
+#    из них теряет соединение. Правило udev закрывает новые устройства,
+#    этот проход — те, что появились раньше правила.
+# ---------------------------------------------------------------------------
+step_power() {
+    [ "${USB_AUTOSUSPEND_OFF:-1}" = 1 ] || return 0
+    local d
+    for d in /sys/bus/usb/devices/*; do
+        [ -r "$d/idVendor" ] || continue
+        case "$(cat "$d/idVendor" 2>/dev/null)" in
+            12d1|1a40|05e3|2109|0424) ;;      # модемы и типовые хабы
+            *) continue ;;
+        esac
+        [ -w "$d/power/control" ] || continue
+        [ "$(cat "$d/power/control" 2>/dev/null)" = on ] && continue
+        printf 'on\n' > "$d/power/control" 2>/dev/null
+    done
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 2. Zero-CD -> рабочий режим.
+#    Устройство пришло как mass storage (12d1:1f01, 1f02, 1f10..1f14, 1440).
+#    Повторяет цикл виндового DataCard_Setup.exe: найти -> послать команду ->
+#    подождать -> повторить -> принудительно пере-enumerate.
+# ---------------------------------------------------------------------------
+step_zerocd() {
+    command -v usb_modeswitch >/dev/null 2>&1 || return 0
+    local d port pid tries cfg bus dev
+    while read -r d; do
+        [ -d "$d" ] || continue
+        port=$(dev_port "$d"); pid=$(dev_attr "$d" idProduct)
+        [ -n "$pid" ] || continue
+        if [ "$(pid_mode "$pid")" != cdrom ]; then st_del "zerocd.$port"; continue; fi
+
+        tries=$(st_get "zerocd.$port" 0)
+        if [ "$tries" -ge "$ZEROCD_MAX_TRIES" ]; then
+            log "$port 12d1:$pid не переключается за $tries попыток — пере-enumerate"
+            usb_reenumerate "$d"
+            st_set "zerocd.$port" 0
+            continue
+        fi
+        cfg="/etc/usb_modeswitch.d/12d1:$pid"
+        [ -f "$cfg" ] || { log_once "нет конфига $cfg"; continue; }
+        bus=$(dev_attr "$d" busnum); dev=$(dev_attr "$d" devnum)
+        [ -n "$bus" ] && [ -n "$dev" ] || continue
+        log "$port 12d1:$pid в CD-ROM — usb_modeswitch (попытка $(( tries + 1 )))"
+        usb_modeswitch -v 12d1 -p "$pid" -b "$bus" -g "$dev" -c "$cfg" >/dev/null 2>&1
+        st_set "zerocd.$port" $(( tries + 1 ))
+    done < <(usb_devs)
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 3. Выбор USB-конфигурации — главный источник «половина модемов не поднялась».
+#
+#    HiLink отдаёт несколько USB-конфигураций. Одна несёт RNDIS/CDC-ECM — её
+#    берут rndis_host/cdc_ether, появляется ethN, работает DHCP и web-API на
+#    192.168.N.1. Другая несёт NCM — её берёт huawei_cdc_ncm, появляется wwanN
+#    с NOARP, без DHCP и без web-API. Какую взять, ядро решает само
+#    (usb_choose_configuration), и при массовом включении регулярно промахивается.
+#    Ждать бесполезно: состояние стабильное, само не разойдётся.
+#
+#    Это Linux-аналог выбора композиции портов (^PORTSEL) в виндовом стеке.
+#
+#    Стратегия: перебрать конфигурации, запомнить какой драйвер даёт каждая,
+#    сесть на ту, что даёт PREFER_DRIVER (или FALLBACK, если целевой недоступен).
+#    Результат запоминается в /var/lib/e3372/confmap по модели+ревизии прошивки,
+#    поэтому после первой перезагрузки одинаковые модемы правятся сразу.
+# ---------------------------------------------------------------------------
+clear_probes() { rm -f "$RUN/probe.$1."* 2>/dev/null; return 0; }
+
+best_probed() {
+    local port="$1" f cfg drv fallback=""
+    for f in "$RUN/probe.$port."*; do
+        [ -e "$f" ] || continue
+        cfg=${f##*.}; drv=$(cat "$f" 2>/dev/null)
+        if [ "$drv" = "$PREFER_DRIVER" ]; then printf '%s' "$cfg"; return 0; fi
+        if is_ok_driver "$drv" && [ -z "$fallback" ]; then fallback=$cfg; fi
+    done
+    printf '%s' "$fallback"
+    return 0
+}
+
+step_usbcfg() {
+    local d port pid rev key cur tot drv best tries nodrv nxt
+    while read -r d; do
+        [ -d "$d" ] || continue
+        port=$(dev_port "$d")
+        pid=$(dev_attr "$d" idProduct); rev=$(dev_attr "$d" bcdDevice)
+        [ -n "$pid" ] || continue
+        [ "$(pid_mode "$pid")" = cdrom ] && continue        # это забота step_zerocd
+        key="$pid:${rev:-0}"
+
+        cur=$(dev_attr "$d" bConfigurationValue)
+        tot=$(dev_attr "$d" bNumConfigurations)
+        case "$cur" in ''|*[!0-9]*) continue ;; esac
+        case "$tot" in ''|*[!0-9]*) tot=1 ;; esac
+        [ "$tot" -ge 1 ] || tot=1
+
+        drv=$(dev_net_driver "$d")
+
+        # Драйвера ещё нет: устройство не доехало. Даём NODRV_GRACE циклов,
+        # потом считаем конфигурацию бесполезной и идём к следующей — иначе
+        # модем в serial-only композиции будет висеть вечно.
+        if [ -z "$drv" ]; then
+            nodrv=$(st_get "nodrv.$port" 0)
+            if [ "$nodrv" -lt "$NODRV_GRACE" ] || [ "$tot" -le 1 ]; then
+                st_set "nodrv.$port" $(( nodrv + 1 )); continue
+            fi
+            st_set "nodrv.$port" 0
+            st_set "probe.$port.$cur" none
+            nxt=$(( (cur % tot) + 1 ))
+            log "$port: cfg $cur не даёт сетевого драйвера — пробую cfg $nxt"
+            set_config "$d" "$nxt"
+            continue
+        fi
+        st_del "nodrv.$port"
+        st_set "probe.$port.$cur" "$drv"
+
+        # Цель достигнута.
+        if [ "$drv" = "$PREFER_DRIVER" ]; then
+            map_set "$key" "$cur"
+            st_del "cfgtry.$port"; clear_probes "$port"
+            continue
+        fi
+
+        # Выбора нет.
+        if [ "$tot" -le 1 ]; then
+            if is_ok_driver "$drv"; then
+                map_set "$key" "$cur"
+            else
+                log_once "$port 12d1:$pid: единственная USB-конфигурация даёт $drv — нужна HiLink-прошивка"
+            fi
+            continue
+        fi
+
+        # Модель уже изучена на другом экземпляре — сразу на нужную конфигурацию.
+        best=$(map_get "$key")
+        if [ -n "$best" ] && [ "$best" != "$cur" ]; then
+            log "$port: cfg $cur даёт $drv; у модели $key целевая cfg $best — переключаю"
+            set_config "$d" "$best"
+            continue
+        fi
+
+        tries=$(st_get "cfgtry.$port" 0)
+        if [ "$tries" -ge "$CFG_MAX_TRIES" ]; then
+            best=$(best_probed "$port")
+            if [ -n "$best" ] && [ "$best" != "$cur" ]; then
+                log "$port: перебор исчерпан, сажусь на лучшую известную cfg $best"
+                set_config "$d" "$best"
+            elif is_ok_driver "$drv"; then
+                map_set "$key" "$cur"
+                log_once "$port 12d1:$pid: $PREFER_DRIVER недоступен, остаюсь на $drv (cfg $cur)"
+            fi
+            st_set "cfgtry.$port" 0
+            clear_probes "$port"
+            continue
+        fi
+
+        nxt=$(( (cur % tot) + 1 ))
+        log "$port: cfg $cur -> $drv (цель $PREFER_DRIVER), пробую cfg $nxt [$(( tries + 1 ))/$CFG_MAX_TRIES]"
+        set_config "$d" "$nxt"
+        st_set "cfgtry.$port" $(( tries + 1 ))
+    done < <(usb_devs)
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 4. Линк и адрес. Интерфейс поднят, но без IPv4 — просим networkd переиграть
+#    DHCP. Счётчик попыток не даёт зациклиться на мёртвом модеме.
+# ---------------------------------------------------------------------------
+step_link() {
+    local l ifn drv t
+    for l in /sys/class/net/*; do
+        [ -e "$l/device" ] || continue
+        ifn=${l##*/}
+        drv=$(iface_driver "$ifn")
+        is_ok_driver "$drv" || continue
+        [ "$(cat "$l/operstate" 2>/dev/null)" = down ] && ip link set "$ifn" up 2>/dev/null
+        if ip -4 -o addr show dev "$ifn" 2>/dev/null | grep -q 'inet '; then
+            st_del "dhcp.$ifn"; continue
+        fi
+        t=$(st_get "dhcp.$ifn" 0)
+        [ "$t" -ge "$DHCP_MAX_TRIES" ] && { log_once "$ifn: нет IPv4 после $t попыток"; continue; }
+        st_set "dhcp.$ifn" $(( t + 1 ))
+        log "$ifn ($drv) без IPv4 — networkctl reconfigure"
+        networkctl reconfigure "$ifn" >/dev/null 2>&1
+    done
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 5. Policy routing. Отдельная таблица на модем, источник — его адрес.
+#    Работает без networkd-dispatcher: не ждём события routable, которого у
+#    части интерфейсов не бывает (operstate остаётся UNKNOWN).
+# ---------------------------------------------------------------------------
+gc_rules() {
+    local line ipaddr tbl last
+    while read -r line; do
+        case "$line" in *"from $HOST_PREFIX."*) ;; *) continue ;; esac
+        ipaddr=$(printf '%s' "$line" | sed -n 's/.*from \([0-9.]*\).*/\1/p')
+        [ -n "$ipaddr" ] || continue
+        # Трогаем только адреса вида <prefix>.N.<HOST_OCTET> — то есть заведомо
+        # свои. Чужое правило на 192.168.* (например, руками заведённое для LAN)
+        # сборка мусора не увидит и не снесёт.
+        last=${ipaddr##*.}
+        [ "$last" = "$HOST_OCTET" ] || continue
+        ip -4 -o addr show 2>/dev/null | grep -q " $ipaddr/" && continue
+        tbl=$(printf '%s' "$line" | sed -n 's/.*lookup \([0-9A-Za-z_]*\).*/\1/p')
+        log "убираю осиротевшее правило from $ipaddr (table ${tbl:-?})"
+        ip rule del from "$ipaddr/32" 2>/dev/null
+        case "$tbl" in
+            ''|main|local|default) ;;
+            *) ip route flush table "$tbl" 2>/dev/null ;;
+        esac
+    done < <(ip rule show 2>/dev/null)
+    return 0
+}
+
+step_route() {
+    local iface ipaddr n tbl prio seen=" "
+    gc_rules
+    while read -r iface ipaddr; do
+        [ -n "$iface" ] && [ -n "$ipaddr" ] || continue
+        n=$(printf '%s' "$ipaddr" | cut -d. -f3)
+        case "$n" in ''|*[!0-9]*) continue ;; esac
+
+        # Два модема в одной подсети: у обоих хост получит один и тот же адрес,
+        # маршруты передерутся. Обслуживаем первый, второй помечаем в журнал.
+        case "$seen" in *" $n "*)
+            log_once "N=$n: два интерфейса в одной подсети, $iface пропущен — перенастройте подсеть модема"
+            continue ;;
+        esac
+        seen="$seen$n "
+
+        if [ "${SKIP_SUBNET_COLLISION:-1}" = 1 ] && subnet_busy "$n" "$iface"; then
+            log_once "N=$n ($iface): подсеть занята другим интерфейсом хоста — пропуск"
+            continue
+        fi
+
+        tbl=$(table_for "$n")
+        prio=$(( RULE_PRIO_BASE + (n % 8000) ))
+        ip route replace "$HOST_PREFIX.$n.0/24" dev "$iface" src "$ipaddr" table "$tbl" 2>/dev/null
+        ip route replace default via "$HOST_PREFIX.$n.$GW_OCTET" dev "$iface" table "$tbl" 2>/dev/null
+        rule_ensure "$ipaddr" "$tbl" "$prio"
+    done < <(modem_ips)
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 6. HiLink web-API: мобильные данные и дозвон. Тяжёлый шаг (сеть, 40 модемов),
+#    поэтому не каждый цикл и параллельно с ограничением по количеству.
+# ---------------------------------------------------------------------------
+step_hilink() {
+    command -v curl >/dev/null 2>&1 || return 0
+    [ "${AUTO_DATASWITCH:-1}" = 1 ] || [ "${AUTO_RECONNECT:-1}" = 1 ] || return 0
+    [ $(( CYCLE % HILINK_EVERY )) -eq 0 ] || return 0
+    modem_ips | xargs -r -P "$HILINK_CONCURRENCY" -n 2 "$0" --modem 2>/dev/null
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 7. DNS. Модемы не должны влиять на резолвинг хоста (это задано в .network),
+#    но если resolv.conf-файл всё же остался вообще без nameserver — хост слепнет.
+#    Симлинки systemd-resolved не трогаем.
+# ---------------------------------------------------------------------------
+step_dns() {
+    [ -L /etc/resolv.conf ] && return 0
+    grep -q '^nameserver' /etc/resolv.conf 2>/dev/null && return 0
+    log "resolv.conf без nameserver — ставлю фолбэк ($DNS_FALLBACK)"
+    { local s; for s in $DNS_FALLBACK; do printf 'nameserver %s\n' "$s"; done; } > /etc/resolv.conf 2>/dev/null
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+step_power
+step_zerocd
+step_usbcfg
+step_link
+step_route
+step_hilink
+step_dns
+exit 0

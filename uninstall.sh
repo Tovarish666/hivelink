@@ -1,71 +1,57 @@
-#!/bin/bash
-# hivelink — удаление.
-#   bash uninstall.sh            снять всё, конфиг и состояние оставить
-#   bash uninstall.sh --purge    снести вместе с конфигом и картой слотов
-
+#!/usr/bin/env bash
+# =============================================================================
+#  Откат e3372-driver. Модемы останутся как есть, но без маршрутов и без
+#  автоматического восстановления.
+#    PURGE_PKGS=1  — снести и установленные пакеты
+#    KEEP_CONF=1   — оставить /etc/e3372/e3372.conf
+# =============================================================================
 set -uo pipefail
+[ "$(id -u)" = 0 ] || { echo "нужен root" >&2; exit 1; }
 
-PURGE=0
-[ "${1:-}" = "--purge" ] && PURGE=1
+echo "[e3372] останавливаю драйвер…"
+systemctl disable --now e3372-reconcile.timer   >/dev/null 2>&1 || true
+systemctl disable --now e3372-reconcile.service >/dev/null 2>&1 || true
+# на случай отката с прошлой версии
+systemctl disable --now e3372-watchdog.timer    >/dev/null 2>&1 || true
+systemctl disable --now e3372-watchdog.service  >/dev/null 2>&1 || true
 
-say()  { printf '\033[36m==\033[0m %s\n' "$*"; }
-warn() { printf '\033[33m!!\033[0m %s\n' "$*"; }
-die()  { printf '\033[31m!!\033[0m %s\n' "$*" >&2; exit 1; }
+echo "[e3372] снимаю правила маршрутизации…"
+while read -r addr; do
+    n=$(printf '%s' "$addr" | cut -d. -f3)
+    if [ "$n" -ge 1 ] 2>/dev/null && [ "$n" -le 252 ] 2>/dev/null; then tbl=$n; else tbl=$(( 10000 + n )); fi
+    i=0; while [ "$i" -lt 5 ]; do ip rule del from "$addr/32" 2>/dev/null || break; i=$(( i + 1 )); done
+    ip route flush table "$tbl" 2>/dev/null || true
+done < <(ip rule show 2>/dev/null | sed -n 's/.*from \(192\.168\.[0-9]*\.100\)\/32.*/\1/p' | sort -u)
 
-[ "$(id -u)" = 0 ] || die "нужен root"
+echo "[e3372] удаляю файлы…"
+rm -f /etc/systemd/system/e3372-reconcile.service \
+      /etc/systemd/system/e3372-reconcile.timer \
+      /etc/systemd/network/25-e3372.network \
+      /etc/udev/rules.d/70-e3372.rules \
+      /etc/udev/rules.d/71-e3372-ports.rules \
+      /etc/sysctl.d/99-e3372.conf \
+      /usr/local/sbin/e3372-reconcile \
+      /usr/local/bin/e3372-status \
+      /usr/local/bin/e3372-ctl \
+      /usr/local/bin/e3372-doctor
+bash /usr/local/lib/e3372/dkms/build.sh --remove 2>/dev/null || true
+rm -rf /usr/local/lib/e3372 /run/e3372 /var/lib/e3372 /var/cache/e3372
+[ "${KEEP_CONF:-0}" = 1 ] || rm -rf /etc/e3372
 
-say "останавливаю юниты"
-systemctl disable --now hivelink-reconcile.timer   2>/dev/null || true
-systemctl stop            hivelink-reconcile.service 2>/dev/null || true
-rm -f /etc/systemd/system/hivelink-*.service /etc/systemd/system/hivelink-*.timer
-systemctl daemon-reload
+echo "[e3372] возвращаю usb_modeswitch-конфиги…"
+for p in 1f01 1f02 1f10 1f11 1f12 1f13 1f14 1440 14fe 1505 155a 1c0b; do
+    cfg="/etc/usb_modeswitch.d/12d1:$p"
+    if [ -f "$cfg.e3372.bak" ]; then mv -f "$cfg.e3372.bak" "$cfg"
+    elif [ -f "$cfg" ] && grep -q '^HuaweiNewMode=1' "$cfg" 2>/dev/null; then rm -f "$cfg"; fi
+done
 
-say "снимаю DKMS-фикс rndis_host"
-[ -x /opt/hivelink/dkms/build.sh ] && bash /opt/hivelink/dkms/build.sh --remove || true
-
-say "udev и sysctl"
-rm -f /etc/udev/rules.d/70-hivelink.rules
-rm -f /etc/sysctl.d/90-hivelink.conf
-rm -f /etc/systemd/network/10-hivelink-modems.network
-
-# Возвращаем штатное авто-переключение: удаляем нашу копию из /etc,
-# после чего снова начинает действовать файл из /lib.
-if [ -f /etc/udev/rules.d/40-usb_modeswitch.rules ] &&
-   grep -q '^# hivelink:' /etc/udev/rules.d/40-usb_modeswitch.rules 2>/dev/null; then
-    rm -f /etc/udev/rules.d/40-usb_modeswitch.rules
-    say "  штатное авто-переключение usb_modeswitch возвращено"
-fi
-
+systemctl daemon-reload 2>/dev/null || true
 udevadm control --reload 2>/dev/null || true
+systemctl restart systemd-networkd 2>/dev/null || true
+sysctl -q -w net.ipv4.conf.all.rp_filter=1 2>/dev/null || true
 
-say "снимаю адресацию модемов"
-if [ -f /var/lib/hivelink/slots ]; then
-    # shellcheck disable=SC1091
-    . /etc/hivelink/hivelink.conf 2>/dev/null || true
-    while read -r _ slot; do
-        [ -n "$slot" ] || continue
-        host="${HL_SUBNET_PREFIX:-192.168}.$slot.${HL_HOST_OCTET:-100}"
-        table=$(( ${HL_TABLE_BASE:-10000} + slot ))
-        ip rule del from "$host" lookup "$table" 2>/dev/null || true
-        ip route flush table "$table" 2>/dev/null || true
-    done </var/lib/hivelink/slots
+if [ "${PURGE_PKGS:-0}" = 1 ]; then
+    echo "[e3372] удаляю пакеты…"
+    apt-get remove -y usb-modeswitch usb-modeswitch-data >/dev/null 2>&1 || true
 fi
-
-say "файлы"
-rm -rf /opt/hivelink
-rm -f  /usr/local/bin/hivelink
-rm -rf /run/hivelink
-
-if [ "$PURGE" = 1 ]; then
-    warn "--purge: сношу конфиг и карту слотов"
-    warn "после этого номера модемов будут выданы заново"
-    rm -rf /etc/hivelink /var/lib/hivelink /var/cache/hivelink
-else
-    say "конфиг и состояние оставлены: /etc/hivelink, /var/lib/hivelink"
-fi
-
-say "возвращаю штатный rndis_host"
-rmmod rndis_host 2>/dev/null || true
-modprobe rndis_host 2>/dev/null || true
-
-say "готово"
+echo "[e3372] готово."

@@ -1,0 +1,18 @@
+[Unit]
+Description=e3372 reconcile — приведение парка модемов к рабочему состоянию
+Documentation=https://github.com/Tovarish666/hivelink
+After=systemd-networkd.service
+Wants=systemd-networkd.service
+# udev дёргает этот юнит на каждое событие Huawei-устройства. При включении
+# сорока модемов это сотни стартов подряд — обычный лимит (5 за 10с) выбьет
+# юнит в failed. Лимит снят; от наложения защищает flock внутри скрипта.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/e3372-reconcile
+# Один проход по 40 модемам с web-API укладывается в десятки секунд; таймаут
+# с запасом, чтобы зависший модем не убил весь цикл на середине.
+TimeoutStartSec=600
+Nice=5
+IOSchedulingClass=idle

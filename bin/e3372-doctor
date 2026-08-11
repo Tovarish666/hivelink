@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  e3372-doctor — полный дамп состояния для разбора проблем.
+#  Ничего не меняет. Вывод можно целиком отдать в issue.
+# =============================================================================
+set -uo pipefail
+# shellcheck source=../lib/common.sh
+. /usr/local/lib/e3372/common.sh
+
+sec() { printf '\n===== %s =====\n' "$*"; }
+
+sec "версия и окружение"
+printf 'e3372-driver %s\n' "$E3372_VERSION"
+uname -a
+[ -r /etc/os-release ] && . /etc/os-release && printf 'os: %s\n' "${PRETTY_NAME:-?}"
+for c in usb_modeswitch curl ethtool lsusb networkctl flock; do
+    printf '%-14s %s\n' "$c" "$(command -v $c 2>/dev/null || echo ОТСУТСТВУЕТ)"
+done
+
+sec "конфигурация"
+printf 'PREFER_DRIVER=%s  FALLBACK=%s\n' "$PREFER_DRIVER" "$FALLBACK_DRIVERS"
+printf 'HOST_PREFIX=%s.N.%s  GW=%s.N.%s\n' "$HOST_PREFIX" "$HOST_OCTET" "$HOST_PREFIX" "$GW_OCTET"
+printf 'AUTO_DATASWITCH=%s AUTO_RECONNECT=%s HILINK_EVERY=%s\n' \
+       "$AUTO_DATASWITCH" "$AUTO_RECONNECT" "$HILINK_EVERY"
+[ -r /etc/e3372/e3372.conf ] && { echo '--- /etc/e3372/e3372.conf ---'; cat /etc/e3372/e3372.conf; }
+
+sec "USB-устройства Huawei"
+printf '%-11s %-6s %-6s %-7s %-14s %s\n' ПОРТ PID REV CFG РЕЖИМ ДРАЙВЕРЫ/IFACE
+while read -r d; do
+    port=$(dev_port "$d")
+    pid=$(dev_attr "$d" idProduct); rev=$(dev_attr "$d" bcdDevice)
+    cur=$(dev_attr "$d" bConfigurationValue); tot=$(dev_attr "$d" bNumConfigurations)
+    info=""
+    for i in "$d":*; do
+        [ -d "$i" ] || continue
+        drv="-"; [ -e "$i/driver" ] && drv=$(basename "$(readlink -f "$i/driver")")
+        nif=""; [ -d "$i/net" ] && nif="=$(ls "$i/net" 2>/dev/null | tr '\n' ',')"
+        info="$info ${i##*:}:$drv$nif"
+    done
+    printf '%-11s %-6s %-6s %-7s %-14s%s\n' "$port" "$pid" "${rev:-?}" "$cur/$tot" "$(pid_mode "$pid")" "$info"
+done < <(usb_devs)
+
+sec "выученные конфигурации (/var/lib/e3372/confmap)"
+cat "$VAR/confmap" 2>/dev/null || echo "(пусто — ещё не изучено)"
+
+sec "счётчики попыток (/run/e3372)"
+for f in "$RUN"/cfgtry.* "$RUN"/zerocd.* "$RUN"/nodrv.* "$RUN"/dhcp.* "$RUN"/probe.*; do
+    [ -e "$f" ] || continue
+    printf '%-40s %s\n' "${f##*/}" "$(cat "$f" 2>/dev/null)"
+done
+
+sec "адреса модемов"
+modem_ips | while read -r i a; do printf '%-16s %-16s drv=%s\n' "$i" "$a" "$(iface_driver "$i")"; done
+
+sec "интерфейсы без адреса (модемные драйверы)"
+for l in /sys/class/net/*; do
+    [ -e "$l/device" ] || continue
+    ifn=${l##*/}; drv=$(iface_driver "$ifn")
+    case " $PREFER_DRIVER $FALLBACK_DRIVERS $BAD_DRIVERS " in *" $drv "*) ;; *) continue ;; esac
+    ip -4 -o addr show dev "$ifn" 2>/dev/null | grep -q 'inet ' && continue
+    printf '%-16s drv=%-14s operstate=%s\n' "$ifn" "$drv" "$(cat "$l/operstate" 2>/dev/null)"
+done
+
+sec "ip rule (модемные)"
+ip rule show 2>/dev/null | grep "$HOST_PREFIX\." || echo "(нет)"
+
+sec "systemd"
+systemctl --no-pager --full status e3372-reconcile.timer 2>/dev/null | head -12
+systemctl --no-pager --full status e3372-reconcile.service 2>/dev/null | head -12
+
+sec "journal (последние 80 строк драйвера)"
+journalctl -t e3372 -n 80 --no-pager 2>/dev/null || echo "(журнал недоступен)"
+
+sec "dmesg: USB-ошибки (последние 40)"
+dmesg 2>/dev/null | grep -iE 'usb|hub' | grep -iE 'error|fail|reset|disconnect|over-?current|cannot|unable' | tail -40 \
+    || echo "(нет или нет прав)"
+
+sec "resolv.conf"
+ls -l /etc/resolv.conf 2>/dev/null; cat /etc/resolv.conf 2>/dev/null
+exit 0

@@ -1,0 +1,39 @@
+# =============================================================================
+#  Стабильные имена AT-портов Huawei по ФУНКЦИИ интерфейса, а не по номеру
+#  ttyUSB. Номера позиционные и разъезжаются при добавлении модема; функция
+#  зашита в дескриптор и не меняется.
+#
+#  Карта Prot -> функция взята из ew_cdcacm.inf оригинального пакета
+#  HUAWEI Drivers 5.05.01.158. Там же видно, что сама Huawei матчится на
+#  USB\VID_12D1&Subclass_03&Prot_XX, а не на &MI_xx:
+#     02/12/72 PCUI (основной AT)   03/13/63/73 DIAG    05/14/65/74 GPS
+#     06/66    Control              0e/15/75    PCVoice 18/19       ShellA/B
+#     1a/1b/1c SerialA/B/C
+#
+#  HiLink-модемы ttyUSB не отдают — правило актуально для stick-режима и для
+#  диагностики. Ключ — физический USB-путь: серийники в парке совпадают.
+#  Результат: /dev/huawei/<usb-path>-pcui и т.д.
+# =============================================================================
+
+ACTION!="add", GOTO="hw_ports_end"
+SUBSYSTEM!="tty", GOTO="hw_ports_end"
+ATTRS{idVendor}!="12d1", GOTO="hw_ports_end"
+
+IMPORT{builtin}="path_id"
+
+ATTRS{bInterfaceProtocol}=="02|12|72",    ENV{E3372_FN}="pcui"
+ATTRS{bInterfaceProtocol}=="03|13|63|73", ENV{E3372_FN}="diag"
+ATTRS{bInterfaceProtocol}=="05|14|65|74", ENV{E3372_FN}="gps"
+ATTRS{bInterfaceProtocol}=="06|66",       ENV{E3372_FN}="ctrl"
+ATTRS{bInterfaceProtocol}=="0e|15|75",    ENV{E3372_FN}="pcvoice"
+ATTRS{bInterfaceProtocol}=="18",          ENV{E3372_FN}="shella"
+ATTRS{bInterfaceProtocol}=="19",          ENV{E3372_FN}="shellb"
+ATTRS{bInterfaceProtocol}=="1a",          ENV{E3372_FN}="seriala"
+ATTRS{bInterfaceProtocol}=="1b",          ENV{E3372_FN}="serialb"
+ATTRS{bInterfaceProtocol}=="1c",          ENV{E3372_FN}="serialc"
+
+ENV{E3372_FN}=="", GOTO="hw_ports_end"
+ENV{ID_PATH}=="", GOTO="hw_ports_end"
+SYMLINK+="huawei/$env{ID_PATH}-$env{E3372_FN}"
+
+LABEL="hw_ports_end"

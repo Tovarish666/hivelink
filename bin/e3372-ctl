@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  e3372-ctl — ручные операции поверх драйвера.
+#
+#    e3372-ctl run                 прогнать цикл приведения к норме прямо сейчас
+#    e3372-ctl dataon [N|--all]    включить мобильные данные
+#    e3372-ctl dial N              принудительный дозвон
+#    e3372-ctl reconnect N         отключить и снова подключить
+#    e3372-ctl reset N             пере-enumerate USB-устройства модема
+#    e3372-ctl recfg N|--all       забыть выученную конфигурацию и перебрать заново
+#    e3372-ctl forget              очистить всё выученное и все счётчики
+#    e3372-ctl api N <path>        сырой запрос к web-API модема
+# =============================================================================
+set -uo pipefail
+# shellcheck source=../lib/common.sh
+. /usr/local/lib/e3372/common.sh
+
+[ "$(id -u)" = 0 ] || { echo "нужен root" >&2; exit 1; }
+usage() { sed -n '2,15p' "$0"; exit "${1:-0}"; }
+
+gw_of()  { printf '%s.%s.%s' "$HOST_PREFIX" "$1" "$GW_OCTET"; }
+ip_of()  { printf '%s.%s.%s' "$HOST_PREFIX" "$1" "$HOST_OCTET"; }
+iface_of() { modem_ips | awk -v want="$(ip_of "$1")" '$2==want{print $1; exit}'; }
+
+# USB-устройство по номеру подсети
+dev_of() {
+    local ifn port
+    ifn=$(iface_of "$1") || return 1
+    [ -n "$ifn" ] || return 1
+    port=$(iface_usb_port "$ifn") || return 1
+    printf '/sys/bus/usb/devices/%s' "$port"
+}
+
+with_session() {                 # n path [body]
+    local n="$1" path="$2" body="${3:-}" gw ses sid tok
+    gw=$(gw_of "$n")
+    ses=$(hl_session "$gw") || { echo "N=$n: сессия не получена ($gw недоступен)" >&2; return 1; }
+    sid=${ses%%|*}; tok=${ses##*|}
+    if [ -n "$body" ]; then hl_post "$gw" "$sid" "$tok" "$path" "$body"
+    else hl_get "$gw" "$sid" "$tok" "$path"; fi
+    printf '\n'
+}
+
+targets() {                      # --all | N...
+    if [ "${1:-}" = "--all" ] || [ $# -eq 0 ]; then
+        modem_ips | awk '{split($2,b,"."); print b[3]}' | sort -n
+    else
+        printf '%s\n' "$@"
+    fi
+}
+
+cmd=${1:-}; [ -n "$cmd" ] || usage 1; shift || true
+
+case "$cmd" in
+    run)
+        exec /usr/local/sbin/e3372-reconcile
+        ;;
+    dataon)
+        for n in $(targets "$@"); do
+            printf 'N=%s: ' "$n"
+            with_session "$n" /api/dialup/mobile-dataswitch \
+                '<?xml version="1.0" encoding="UTF-8"?><request><dataswitch>1</dataswitch></request>'
+        done
+        ;;
+    dial)
+        [ $# -ge 1 ] || usage 1
+        for n in "$@"; do
+            printf 'N=%s: ' "$n"
+            with_session "$n" /api/dialup/dial \
+                '<?xml version="1.0" encoding="UTF-8"?><request><Action>1</Action></request>'
+        done
+        ;;
+    reconnect)
+        [ $# -ge 1 ] || usage 1
+        for n in "$@"; do
+            printf 'N=%s down: ' "$n"
+            with_session "$n" /api/dialup/dial \
+                '<?xml version="1.0" encoding="UTF-8"?><request><Action>0</Action></request>'
+            sleep 3
+            printf 'N=%s up:   ' "$n"
+            with_session "$n" /api/dialup/dial \
+                '<?xml version="1.0" encoding="UTF-8"?><request><Action>1</Action></request>'
+            st_del "dial.$n"
+        done
+        ;;
+    reset)
+        [ $# -ge 1 ] || usage 1
+        for n in "$@"; do
+            d=$(dev_of "$n") || { echo "N=$n: устройство не найдено" >&2; continue; }
+            echo "N=$n: пере-enumerate ${d##*/}"
+            usb_reenumerate "$d"
+        done
+        ;;
+    recfg)
+        for n in $(targets "$@"); do
+            d=$(dev_of "$n") || { echo "N=$n: устройство не найдено" >&2; continue; }
+            port=${d##*/}
+            pid=$(dev_attr "$d" idProduct); rev=$(dev_attr "$d" bcdDevice)
+            sed -i "/^$pid:${rev:-0} /d" "$VAR/confmap" 2>/dev/null
+            rm -f "$RUN/probe.$port."* "$RUN/cfgtry.$port" "$RUN/nodrv.$port" 2>/dev/null
+            echo "N=$n ($port, $pid:${rev:-0}): выученное сброшено"
+        done
+        /usr/local/sbin/e3372-reconcile
+        ;;
+    forget)
+        rm -f "$VAR/confmap" 2>/dev/null
+        rm -f "$RUN"/probe.* "$RUN"/cfgtry.* "$RUN"/nodrv.* "$RUN"/zerocd.* \
+              "$RUN"/dhcp.* "$RUN"/dial.* "$RUN"/.msg.* 2>/dev/null
+        echo "всё выученное и все счётчики очищены"
+        ;;
+    api)
+        [ $# -ge 2 ] || usage 1
+        with_session "$1" "$2"
+        ;;
+    -h|--help|help) usage 0 ;;
+    *) echo "неизвестная команда: $cmd" >&2; usage 1 ;;
+esac

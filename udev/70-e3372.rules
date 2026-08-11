@@ -1,0 +1,23 @@
+# =============================================================================
+#  e3372-driver: реакция на события USB и питание шины.
+# =============================================================================
+
+ACTION=="remove", GOTO="e3372_end"
+SUBSYSTEM!="usb|net", GOTO="e3372_end"
+
+# --- Автосуспенд выключен для модемов и типовых хабов ------------------------
+# Уснувший хаб роняет всю ветку разом; уснувший модем теряет сотовую сессию.
+SUBSYSTEM=="usb", ATTR{idVendor}=="12d1", TEST=="power/control", ATTR{power/control}="on"
+SUBSYSTEM=="usb", ATTR{idVendor}=="1a40|05e3|2109|0424", TEST=="power/control", ATTR{power/control}="on"
+
+# --- Мгновенный запуск драйвера ---------------------------------------------
+# --no-block обязателен: udev убивает RUN дольше event_timeout, а полный цикл
+# по сорока модемам в этот бюджет не влезает. Юнит oneshot + flock внутри,
+# поэтому шторм событий схлопывается в одну очередь.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="12d1", \
+    RUN+="/usr/bin/systemctl --no-block start e3372-reconcile.service"
+
+SUBSYSTEM=="net", ACTION=="add", ENV{ID_VENDOR_ID}=="12d1", \
+    RUN+="/usr/bin/systemctl --no-block start e3372-reconcile.service"
+
+LABEL="e3372_end"
