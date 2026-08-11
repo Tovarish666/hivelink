@@ -21,6 +21,11 @@ HL_SLOT_MIN=101                 # диапазон номеров модемов
 HL_SLOT_MAX=250
 HL_IFACE_PREFIX="mdm"           # имя интерфейса = mdm<N>
 
+# Жёсткая привязка «USB-порт:номер» через пробел, например "3-3:104 3-1.4.1.1:101".
+# Приоритет надо всем: нужна, когда номер уже зашит во внешние системы
+# (прокси, правила, выгрузки) и менять адрес нельзя.
+HL_SLOT_PIN=""
+
 HL_PREFER_DRIVER="auto"         # auto | rndis_host | cdc_ether | cdc_ncm
 HL_RX_URB_SIZE=16384            # обход бага rndis_host, 0 = штатное поведение
 HL_DNS_GUARD=1                  # не пускать DNS модема в системный резолвер
@@ -150,13 +155,29 @@ hl_state_init() {
 
 # Номер модема по USB-пути. Привязка вечная: тот же физический порт —
 # всегда тот же N, независимо от порядка появления и от того, кто поднялся первым.
+#
+# Порядок разрешения:
+#   1) HL_SLOT_PIN из конфига — декларативно, переживает потерю состояния
+#   2) ранее выданный номер из карты слотов
+#   3) первый свободный номер, с записью в карту
 hl_slot_for_port() {
-    local port="$1" n
+    local port="$1" n pin
+
+    for pin in $HL_SLOT_PIN; do
+        case "$pin" in
+            "$port":*) printf '%s\n' "${pin#*:}"; return 0 ;;
+        esac
+    done
+
     n=$(awk -v p="$port" '$1==p{print $2; exit}' "$HL_SLOTS" 2>/dev/null)
     if [ -n "$n" ]; then printf '%s\n' "$n"; return 0; fi
 
+    # Занятыми считаем и выданные ранее, и закреплённые в конфиге —
+    # иначе автовыдача наступит на пин и два модема получат один адрес.
     local used n2
-    used=$(awk '{print $2}' "$HL_SLOTS" 2>/dev/null | sort -n)
+    used=$( { awk '{print $2}' "$HL_SLOTS" 2>/dev/null
+              for pin in $HL_SLOT_PIN; do printf '%s\n' "${pin#*:}"; done
+            } | sort -n )
     n2="$HL_SLOT_MIN"
     while [ "$n2" -le "$HL_SLOT_MAX" ]; do
         printf '%s\n' "$used" | grep -qx "$n2" || break
