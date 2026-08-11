@@ -45,8 +45,10 @@ if ! apt-get check >/dev/null 2>&1; then
         || die "apt --fix-broken install не справился, разберись руками"
 fi
 
+# udhcpc (из busybox) нужен для РАЗВЕДКИ подсети модема: спросить,
+# где он уже живёт, и принять это вместо навязывания своего номера.
 PKGS="usb-modeswitch usb-modeswitch-data curl iproute2 iputils-ping
-      util-linux usbutils dkms build-essential python3 wget"
+      util-linux usbutils dkms build-essential python3 wget busybox"
 
 NEED=""
 for p in $PKGS; do
@@ -86,6 +88,7 @@ mkdir -p "$DEST/lib" "$DEST/sbin" "$DEST/bin" "$DEST/dkms" "$ETC" "$VAR" "$RUN"
 
 say "файлы"
 install -m 644 "$SRC"/lib/*.sh              "$DEST/lib/"
+chmod 755 "$DEST/lib/dhcp-probe.sh"          # вызывается udhcpc как хук
 install -m 755 "$SRC/sbin/hivelink-reconcile" "$DEST/sbin/hivelink-reconcile"
 install -m 755 "$SRC/bin/hivelink"            "$DEST/bin/hivelink"
 install -m 755 "$SRC/dkms/build.sh"           "$DEST/dkms/build.sh"

@@ -111,7 +111,7 @@ hl_hilink_set_lan() {
 #
 #   hl_hilink_provision <slot> <iface>   -> 0 модем на своём адресе
 hl_hilink_provision() {
-    local slot="$1" iface="$2"
+    local slot="$1" iface="$2" port="${3:-}"
     local want_gw want_host cand tmp_host ok=1
 
     want_gw=$(hl_gw "$slot"); want_host=$(hl_host "$slot")
@@ -120,6 +120,26 @@ hl_hilink_provision() {
     if ping -c1 -W2 -I "$want_host" "$want_gw" >/dev/null 2>&1; then
         return 0
     fi
+
+    # Не на месте — но, может, модем настроен на другую подсеть и прекрасно
+    # работает. Сначала выясняем это и запоминаем: следующий цикл примет
+    # его номер вместо того, чтобы переселять.
+    if [ "${HL_ADOPT_LAN:-1}" = 1 ] && [ -n "$port" ]; then
+        local found
+        found=$(hl_discover_lan "$iface" 2>/dev/null)
+        if [ -n "$found" ]; then
+            hl_lanhint_set "$port" "$found"
+            if [ "$found" != "$slot" ]; then
+                info "слот $slot: модем на самом деле в подсети $found — приму её следующим циклом"
+                return 1
+            fi
+        fi
+    fi
+
+    [ "${HL_PROVISION_LAN:-1}" = 1 ] || {
+        dbg "слот $slot: переопределение LAN выключено конфигом"
+        return 1
+    }
 
     local tries
     tries=$(hl_cnt_get provision "$slot")

@@ -35,6 +35,15 @@ HL_HILINK_ENABLE=1              # ходить в веб-API модема
 HL_HILINK_TIMEOUT=6
 HL_HILINK_DATASWITCH=1          # включать передачу данных, если выключена
 
+# ------------------------------------------------------------ не мешать ---
+# Границы вмешательства. Всё, что может изменить настройки самого модема
+# или глобальные параметры хоста, выключается одним переключателем.
+
+HL_PROVISION_LAN=1              # переопределять LAN модема, если подсеть занята
+HL_ADOPT_LAN=1                  # принимать подсеть, на которой модем уже стоит
+HL_SYSCTL_GLOBAL=1              # трогать общесистемные sysctl (arp_ignore и пр.)
+HL_RENAME_IFACE=1               # переименовывать интерфейс в mdm<N>
+
 HL_ZEROCD_TRIES=3               # попыток usb_modeswitch до re-enumerate
 HL_MODESWITCH_REQUIRED=1        # 1 = отсутствие usb_modeswitch это ОШИБКА
 
@@ -82,13 +91,23 @@ HL_LOG_STDERR=auto              # auto | 1 | 0  (auto: в tty пишем, ина
 
 # Реестр устройств: "vid:pid  семейство  предпочтительный_драйвер"
 # Семейства: hilink (веб-API + DHCP от модема), ncm, ether, generic
+#
+# Драйвер здесь — СПРАВОЧНЫЙ, а не принудительный: если модем уже поднялся
+# на другом драйвере и работает, никто его не трогает. Значение используется
+# только когда сетевого интерфейса нет вовсе.
+#
+# Покрыты E3372h-153/-320/-607, E3372s-153, K5150/K5160 и родня.
 HL_REGISTRY_DEFAULT='
 12d1:14db hilink rndis_host
 12d1:14dc hilink cdc_ether
-12d1:1506 ncm    cdc_ncm
+12d1:14fe hilink cdc_ether
 12d1:155e hilink rndis_host
+12d1:1568 hilink rndis_host
 12d1:14ac hilink cdc_ether
 12d1:1442 hilink cdc_ether
+12d1:1506 ncm    cdc_ncm
+12d1:1509 ncm    cdc_ncm
+12d1:15ca ncm    cdc_ncm
 '
 # PID «установочного» Zero-CD режима — их надо переключать
 HL_ZEROCD_PIDS="1f01 1f02 1f10 1f11 1f12 1f13 1f14 1440"
@@ -294,6 +313,18 @@ hl_slot_for_port() {
     n="${HL_MAP_PORT2SLOT[$port]:-}"
     if [ -n "$n" ]; then HL_SLOT="$n"; printf '%s\n' "$n"; return 0; fi
 
+    # 2.5) модем УЖЕ живёт на какой-то подсети (разведка прошлого цикла).
+    #      Принимаем её, если номер свободен: переселять работающий модем
+    #      только ради «правильного» номера — это мешать, а не помогать.
+    n=$(hl_lanhint_get "$port")
+    if [ -n "$n" ] && [ -z "${HL_MAP_USED[$n]:-}" ]; then
+        printf '%s %s\n' "$port" "$n" >>"$HL_SLOTS"
+        HL_MAP_PORT2SLOT["$port"]="$n"; HL_MAP_USED["$n"]=1
+        info "порт $port: модем уже настроен на подсеть $n — принимаю как есть"
+        HL_SLOT="$n"; printf '%s\n' "$n"; return 0
+    fi
+    [ -n "$n" ] && warn "порт $port: модем на подсети $n, но она занята — придётся переопределить"
+
     # 3) первый свободный
     n2="$HL_SLOT_MIN"
     while [ "$n2" -le "$HL_SLOT_MAX" ]; do
@@ -359,6 +390,28 @@ hl_imei_set() {
 
 hl_imei_get()       { awk -v p="$1" '$1==p{print $2; exit}' "$HL_IMEI" 2>/dev/null; }
 hl_imei_port()      { awk -v i="$1" '$2==i{print $1; exit}' "$HL_IMEI" 2>/dev/null; }
+
+# ------------------------------------------------- подсказка по подсети ----
+#
+# Модем уже настроен на какую-то подсеть — своим прошлым владельцем,
+# старым стеком или вручную. Разведка (DHCP) выясняет её в рабочем потоке,
+# а следующий цикл принимает этот номер вместо того, чтобы навязывать свой.
+# Так hivelink подхватывает готовую ферму, ничего не переселяя.
+
+HL_LANHINT="$HL_VAR/lanhint"
+
+hl_lanhint_set() {
+    local port="$1" n="$2" tmp
+    [ -n "$n" ] || return 0
+    [ "$(awk -v p="$port" '$1==p{print $2; exit}' "$HL_LANHINT" 2>/dev/null)" = "$n" ] && return 0
+    tmp=$(mktemp "$HL_LANHINT.XXXXXX" 2>/dev/null) || return 0
+    { awk -v p="$port" '$1!=p' "$HL_LANHINT" 2>/dev/null
+      printf '%s %s\n' "$port" "$n"; } >"$tmp" && mv -f "$tmp" "$HL_LANHINT"
+    rm -f "$tmp" 2>/dev/null
+    return 0
+}
+
+hl_lanhint_get() { awk -v p="$1" '$1==p{print $2; exit}' "$HL_LANHINT" 2>/dev/null; }
 
 hl_confmap_get() { awk -v k="$1" '$1==k{print $2; exit}' "$HL_CONFMAP" 2>/dev/null; }
 

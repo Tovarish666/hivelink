@@ -11,6 +11,13 @@
 
 hl_sysctl_apply() {
     local n
+    # arp_ignore/arp_announce на all меняют поведение ВСЕГО хоста.
+    # Для фермы с одинаковыми MAC это необходимо, но если hivelink
+    # подселён к чему-то чувствительному — выключается одной строкой.
+    [ "${HL_SYSCTL_GLOBAL:-1}" = 1 ] || {
+        sysctl -qw net.ipv4.ip_forward=1 2>/dev/null
+        return 0
+    }
     for n in all default; do
         sysctl -qw "net.ipv4.conf.$n.rp_filter=2"    2>/dev/null
         sysctl -qw "net.ipv4.conf.$n.arp_ignore=1"   2>/dev/null
@@ -275,6 +282,52 @@ hl_dns_snapshot() {
         warn "в /etc/resolv.conf нет пригодных nameserver — задай HL_DNS_UPSTREAM вручную"
         return 1
     fi
+}
+
+# ------------------------------------------------------------- разведка ---
+#
+# Прежде чем что-то менять, надо узнать, где модем УЖЕ живёт. Иначе
+# hivelink переселит нормально работающий модем со своего адреса на «свой»
+# и сломает то, что работало.
+#
+# Спрашиваем сам модем через DHCP. Хук намеренно ничего не настраивает —
+# штатный скрипт udhcpc прописал бы DNS модема в системный резолвер.
+#
+# Печатает третий октет подсети модема, либо ничего.
+
+hl_discover_lan() {
+    local iface="$1" out gw n
+    out="$HL_RUN/dhcp.$iface"
+    rm -f "$out"
+
+    ip link set dev "$iface" up 2>/dev/null
+
+    if command -v udhcpc >/dev/null 2>&1; then
+        HL_DHCP_OUT="$out" timeout 8 udhcpc -i "$iface" -q -n -t 3 -T 2 \
+            -s "$HL_LIB/dhcp-probe.sh" >/dev/null 2>&1
+    elif command -v busybox >/dev/null 2>&1; then
+        HL_DHCP_OUT="$out" timeout 8 busybox udhcpc -i "$iface" -q -n -t 3 -T 2 \
+            -s "$HL_LIB/dhcp-probe.sh" >/dev/null 2>&1
+    else
+        dbg "$iface: нет udhcpc, разведка подсети недоступна"
+        return 1
+    fi
+
+    [ -s "$out" ] || return 1
+    gw=$(awk '{print $2}' "$out")
+    rm -f "$out"
+    [ -n "$gw" ] || return 1
+
+    # интересует только наш префикс: 192.168.N.1 -> N
+    case "$gw" in
+        "$HL_SUBNET_PREFIX".*) ;;
+        *) dbg "$iface: модем на $gw, это вне префикса $HL_SUBNET_PREFIX"; return 1 ;;
+    esac
+    n=$(printf '%s' "$gw" | cut -d. -f3)
+    [ "$n" -ge "$HL_SLOT_MIN" ] 2>/dev/null || return 1
+    [ "$n" -le "$HL_SLOT_MAX" ] 2>/dev/null || return 1
+
+    printf '%s\n' "$n"
 }
 
 # --------------------------------------------------------- проверка связи --
