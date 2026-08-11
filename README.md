@@ -79,6 +79,40 @@ USB-путь порта виден в `lsusb -t` и в `hivelink slots`. При�
 имеет приоритет над автовыдачей и переживает потерю состояния и переезд
 на другой хост. Без неё номера выдаются заново с `HL_SLOT_MIN`.
 
+## Удаление
+
+```bash
+bash /opt/src/hivelink/uninstall.sh
+```
+
+Если каталога с исходниками нет:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Tovarish666/hivelink/main/uninstall.sh)
+```
+
+Снимает юниты, udev-правила, sysctl- и networkd-дропины, DKMS-модуль,
+адресацию и правила маршрутизации модемов, возвращает штатный `rndis_host`.
+Конфиг и карту слотов **оставляет** — чтобы при переустановке номера
+не поехали. Снести и их:
+
+```bash
+bash /opt/src/hivelink/uninstall.sh --purge
+```
+
+Экстренная остановка без удаления:
+
+```bash
+systemctl disable --now hivelink-reconcile.timer hivelink-reconcile.service
+```
+
+Учти: udev-правило поднимает цикл при перетыкании модема независимо от
+того, включён ли таймер. Чтобы этого не было, правило надо убрать:
+
+```bash
+rm -f /etc/udev/rules.d/70-hivelink.rules && udevadm control --reload
+```
+
 ## Работа
 
 ```bash
