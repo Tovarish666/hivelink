@@ -60,12 +60,28 @@ step_power() {
 # ---------------------------------------------------------------------------
 step_zerocd() {
     command -v usb_modeswitch >/dev/null 2>&1 || return 0
-    local d port pid tries cfg bus dev
+    local d port pid tries cfg bus dev cur tot
     while read -r d; do
         [ -d "$d" ] || continue
         port=$(dev_port "$d"); pid=$(dev_attr "$d" idProduct)
         [ -n "$pid" ] || continue
         if [ "$(pid_mode "$pid")" != cdrom ]; then st_del "zerocd.$port"; continue; fi
+
+        # Zero-CD, но не на первой конфигурации. У этих устройств вторая
+        # конфигурация несёт MBIM: её забирает cdc_mbim, появляется бесполезный
+        # wwanN, а mass-storage endpoint — единственный адресат сообщения
+        # usb_modeswitch — в ней ОТСУТСТВУЕТ. Переключать бесполезно: проверено
+        # на живом парке, 12 модемов отработали по 49 попыток вхолостую.
+        # Сначала конфигурация 1, переключение — следующим циклом.
+        cur=$(dev_attr "$d" bConfigurationValue)
+        tot=$(dev_attr "$d" bNumConfigurations)
+        case "$tot" in ''|*[!0-9]*) tot=1 ;; esac
+        if [ -n "$cur" ] && [ "$cur" != 1 ] && [ "$tot" -gt 1 ] 2>/dev/null; then
+            log "$port 12d1:$pid Zero-CD в cfg $cur/$tot — usb_modeswitch там бессилен, ставлю cfg 1"
+            set_config "$d" 1
+            st_set "zerocd.$port" 0
+            continue
+        fi
 
         tries=$(st_get "zerocd.$port" 0)
         if [ "$tries" -ge "$ZEROCD_MAX_TRIES" ]; then
