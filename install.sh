@@ -200,14 +200,20 @@ sysctl -q --system >/dev/null 2>&1 || warn "sysctl --system с предупре�
 #    на приём. Отключается через SKIP_RNDIS_FIX=1 или RX_URB_SIZE=0 в конфиге.
 # ---------------------------------------------------------------------------
 log "6/8 фикс скорости приёма (DKMS)…"
-if [ "${SKIP_RNDIS_FIX:-0}" = 1 ]; then
-    warn "    пропущен по SKIP_RNDIS_FIX=1 — приём на RNDIS-модемах останется ~1.3 Мбит"
-elif [ ! -r "$SRC/dkms/build.sh" ]; then
-    warn "    в дереве нет dkms/build.sh — пропускаю"
-else
+# Инструменты раскладываем ВСЕГДА, даже когда сборка пропущена: иначе
+# передумать и поставить фикс позже будет нечем.
+if [ -r "$SRC/dkms/build.sh" ]; then
     install -d "$PREFIX_LIB/dkms"
     install -m 0755 "$SRC/dkms/build.sh" "$PREFIX_LIB/dkms/build.sh"
     install -m 0755 "$SRC/dkms/patch.py" "$PREFIX_LIB/dkms/patch.py"
+fi
+
+if [ "${SKIP_RNDIS_FIX:-0}" = 1 ]; then
+    warn "    пропущен по SKIP_RNDIS_FIX=1 — приём на RNDIS-модемах останется ~1.3 Мбит"
+    warn "    поставить позже: bash $PREFIX_LIB/dkms/build.sh"
+elif [ ! -r "$PREFIX_LIB/dkms/build.sh" ]; then
+    warn "    в дереве нет dkms/build.sh — пропускаю"
+else
     if bash "$PREFIX_LIB/dkms/build.sh" 2>&1 | sed 's/^/    /'; then
         log "    фикс установлен"
     else
