@@ -143,6 +143,22 @@ options rndis_host rx_urb_size_override=$SIZE
 EOF
 depmod -a
 
+# ------------------------------------------------------------- initramfs ----
+#
+# Debian по умолчанию собирает initramfs с MODULES=most, то есть кладёт туда
+# и USB-сетевые драйверы. При загрузке udev ВНУТРИ initramfs видит модемы и
+# грузит ШТАТНЫЙ rndis_host из образа. К моменту монтирования настоящего корня
+# модуль уже в памяти, /etc/modprobe.d не применяется, и фикс молча не работает
+# после каждой перезагрузки — при том что modinfo показывает правильный файл.
+#
+# Поэтому пересобираем образ, чтобы туда попал модуль из /updates.
+if [ -x /usr/sbin/update-initramfs ] || command -v update-initramfs >/dev/null 2>&1; then
+    if lsinitramfs "/boot/initrd.img-$KREL" 2>/dev/null | grep -q 'rndis_host'; then
+        log "пересобираю initramfs (там лежит свой rndis_host)"
+        update-initramfs -u -k "$KREL" 2>&1 | tail -3 | sed 's/^/   /'
+    fi
+fi
+
 # --------------------------------------------------- перезагрузка модуля ----
 #
 # Файл на диске подменён, но в памяти остаётся СТАРЫЙ модуль: простой rmmod

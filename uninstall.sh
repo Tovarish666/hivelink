@@ -38,6 +38,12 @@ bash /usr/local/lib/e3372/dkms/build.sh --remove 2>/dev/null || true
 rm -rf /usr/local/lib/e3372 /run/e3372 /var/lib/e3372 /var/cache/e3372
 [ "${KEEP_CONF:-0}" = 1 ] || rm -rf /etc/e3372
 
+echo "[e3372] возвращаю штатное авто-переключение usb_modeswitch…"
+if [ -f /etc/udev/rules.d/40-usb_modeswitch.rules ] &&
+   grep -q '^# e3372-driver:' /etc/udev/rules.d/40-usb_modeswitch.rules 2>/dev/null; then
+    rm -f /etc/udev/rules.d/40-usb_modeswitch.rules
+fi
+
 echo "[e3372] возвращаю usb_modeswitch-конфиги…"
 for p in 1f01 1f02 1f10 1f11 1f12 1f13 1f14 1440 14fe 1505 155a 1c0b; do
     cfg="/etc/usb_modeswitch.d/12d1:$p"
