@@ -204,12 +204,21 @@ restore_timer() {
 }
 trap restore_timer EXIT
 
+# Запоминаем, что отвязали: обратно оно само НЕ вернётся. udevadm trigger
+# явно отвязанный интерфейс не переподключает, и модемы остаются без сетевой
+# функции — наблюдалось: пять устройств после подмены пропали из парка.
+UNBOUND=""
+
 i=1
 while [ "$i" -le 5 ]; do
     n=0
     for l in /sys/bus/usb/drivers/rndis_host/*:*; do
         [ -e "$l" ] || continue
-        echo "$(basename "$l")" > /sys/bus/usb/drivers/rndis_host/unbind 2>/dev/null && n=$((n + 1))
+        b=$(basename "$l")
+        if echo "$b" > /sys/bus/usb/drivers/rndis_host/unbind 2>/dev/null; then
+            n=$((n + 1))
+            case " $UNBOUND " in *" $b "*) ;; *) UNBOUND="$UNBOUND $b" ;; esac
+        fi
     done
     [ "$n" -gt 0 ] && log "  попытка $i: отвязано интерфейсов $n"
     sleep 3
@@ -221,8 +230,25 @@ while [ "$i" -le 5 ]; do
     i=$((i + 1))
 done
 
-# Устройства вернутся сами по udev; подтолкнём, чтобы не ждать таймера.
+# Возвращаем ровно то, что отвязали.
+back=0
+for b in $UNBOUND; do
+    [ -d "/sys/bus/usb/devices/$b" ] || continue
+    [ -e "/sys/bus/usb/devices/$b/driver" ] && continue
+    echo "$b" > /sys/bus/usb/drivers/rndis_host/bind 2>/dev/null && back=$((back + 1))
+done
+
+# Подстраховка: любой RNDIS-интерфейс (класс e0/01/03) без драйвера.
+for l in /sys/bus/usb/devices/*:*; do
+    [ -d "$l" ] || continue
+    [ "$(cat "$l/bInterfaceClass" 2>/dev/null)" = "e0" ] || continue
+    [ -e "$l/driver" ] && continue
+    echo "$(basename "$l")" > /sys/bus/usb/drivers/rndis_host/bind 2>/dev/null && back=$((back + 1))
+done
+[ "$back" -gt 0 ] && log "  привязано обратно интерфейсов: $back"
+
 udevadm trigger --subsystem-match=usb --attr-match=idVendor=12d1 >/dev/null 2>&1 || true
+sleep 2
 
 # ------------------------------------------------------------- проверка -----
 f=$(modinfo rndis_host 2>/dev/null | awk '/^filename/{print $2}')
