@@ -324,6 +324,21 @@ step_dns() {
 }
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 8. Фикс скорости приёма: проверяем не файл на диске, а то, что в памяти.
+#    Типичная поломка — modinfo показывает пропатченный модуль из /updates/dkms,
+#    а загружен штатный (например, подхваченный из initramfs при загрузке).
+#    Снаружи это выглядит как «всё встало, но download ~1.3 Мбит».
+#    Только сообщаем: чинить самим значит дёргать модуль под работающим парком.
+# ---------------------------------------------------------------------------
+step_fixcheck() {
+    [ -d /sys/module/rndis_host ] || return 0
+    [ -n "$(ls -d /sys/bus/usb/drivers/rndis_host/*:* 2>/dev/null)" ] || return 0
+    [ -e /sys/module/rndis_host/parameters/rx_urb_size_override ] && return 0
+    log_once "фикс rndis_host НЕ активен: в памяти штатный модуль, приём будет ~1.3 Мбит — bash /usr/local/lib/e3372/dkms/build.sh"
+    return 0
+}
+
 step_power
 step_zerocd
 step_usbcfg
@@ -331,4 +346,5 @@ step_link
 step_route
 step_hilink
 step_dns
+step_fixcheck
 exit 0

@@ -24,6 +24,32 @@ printf 'AUTO_DATASWITCH=%s AUTO_RECONNECT=%s HILINK_EVERY=%s\n' \
        "$AUTO_DATASWITCH" "$AUTO_RECONNECT" "$HILINK_EVERY"
 [ -r /etc/e3372/e3372.conf ] && { echo '--- /etc/e3372/e3372.conf ---'; cat /etc/e3372/e3372.conf; }
 
+sec "фикс скорости приёма (rndis_host)"
+# Проверяем не файл на диске, а то, что реально загружено: типичная поломка —
+# modinfo показывает пропатченный модуль из /updates/dkms, а в памяти висит
+# штатный (например, подхваченный из initramfs на загрузке).
+f=$(modinfo rndis_host 2>/dev/null | awk '/^filename/{print $2}')
+p=$(cat /sys/module/rndis_host/parameters/rx_urb_size_override 2>/dev/null)
+sv_file=$(modinfo -F srcversion rndis_host 2>/dev/null)
+sv_mem=$(cat /sys/module/rndis_host/srcversion 2>/dev/null)
+printf 'файл:           %s\n' "${f:-не найден}"
+printf 'параметр:       %s\n' "${p:-ОТСУТСТВУЕТ}"
+printf 'srcversion:     файл=%s ядро=%s\n' "${sv_file:-?}" "${sv_mem:-не загружен}"
+dkms status 2>/dev/null | grep e3372-rndis-fix || echo 'dkms:           пакета нет'
+if [ -z "$p" ] && lsmod | grep -q '^rndis_host'; then
+    echo 'ВЫВОД: в памяти ШТАТНЫЙ модуль — приём на RNDIS-модемах будет ~1.3 Мбит.'
+    echo '       Лечится: bash /usr/local/lib/e3372/dkms/build.sh'
+elif [ "${p:-0}" = 0 ]; then
+    echo 'ВЫВОД: фикс выключен (RX_URB_SIZE=0).'
+else
+    echo "ВЫВОД: фикс активен, rx_urb_size=$p"
+fi
+if command -v lsinitramfs >/dev/null 2>&1; then
+    n=$(lsinitramfs "/boot/initrd.img-$(uname -r)" 2>/dev/null | grep -c rndis_host || echo 0)
+    [ "$n" -gt 0 ] 2>/dev/null && \
+        echo "ВНИМАНИЕ: rndis_host лежит в initramfs — после перезагрузки загрузится он, не наш."
+fi
+
 sec "USB-устройства Huawei"
 printf '%-11s %-6s %-6s %-7s %-14s %s\n' ПОРТ PID REV CFG РЕЖИМ ДРАЙВЕРЫ/IFACE
 while read -r d; do

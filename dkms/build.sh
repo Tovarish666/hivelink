@@ -152,11 +152,25 @@ depmod -a
 # после каждой перезагрузки — при том что modinfo показывает правильный файл.
 #
 # Поэтому пересобираем образ, чтобы туда попал модуль из /updates.
-if [ -x /usr/sbin/update-initramfs ] || command -v update-initramfs >/dev/null 2>&1; then
-    if lsinitramfs "/boot/initrd.img-$KREL" 2>/dev/null | grep -q 'rndis_host'; then
-        log "пересобираю initramfs (там лежит свой rndis_host)"
-        update-initramfs -u -k "$KREL" 2>&1 | tail -3 | sed 's/^/   /'
+if command -v update-initramfs >/dev/null 2>&1; then
+    IMG="/boot/initrd.img-$KREL"
+    before=0
+    command -v lsinitramfs >/dev/null 2>&1 && [ -r "$IMG" ] &&
+        before=$(lsinitramfs "$IMG" 2>/dev/null | grep -c 'rndis_host' || echo 0)
+    if [ "$before" -gt 0 ] 2>/dev/null; then
+        log "в initramfs лежит свой rndis_host — пересобираю образ"
+        if update-initramfs -u -k "$KREL" >/tmp/e3372-initramfs.log 2>&1; then
+            after=$(lsinitramfs "$IMG" 2>/dev/null | grep -c 'rndis_host' || echo 0)
+            log "  готово, вхождений rndis_host в образе: было $before, стало $after"
+        else
+            warn "  update-initramfs не отработал, подробности в /tmp/e3372-initramfs.log"
+            warn "  без этого фикс не переживёт перезагрузку"
+        fi
+    else
+        log "в initramfs своего rndis_host нет — пересобирать не нужно"
     fi
+else
+    warn "нет update-initramfs — если модуль попадёт в initramfs, фикс не переживёт ребут"
 fi
 
 # --------------------------------------------------- перезагрузка модуля ----
@@ -170,22 +184,39 @@ fi
 # Поэтому: сначала отвязываем все устройства, потом выгружаем, потом грузим
 # и ПРОВЕРЯЕМ, что параметр появился.
 
-# Одной попытки мало: udev успевает привязать устройства обратно раньше, чем
-# отработает rmmod, тот падает, а modprobe для уже загруженного модуля —
-# пустышка. В памяти остаётся старое значение при новом конфиге. Наблюдалось:
-# в modprobe.d 32768, в /sys/module 16384. Поэтому крутим до совпадения.
+# Подмена модуля гонится с самим драйвером: его таймер тикает каждые 15 секунд
+# и привязывает интерфейсы обратно, пока мы пытаемся выгрузить модуль. rmmod
+# падает, modprobe для уже загруженного модуля — пустышка, и в памяти остаётся
+# старое значение при новом конфиге. Наблюдалось: четыре неудачных попытки
+# подряд из скрипта, а вручную минутой позже — с первой.
+#
+# Поэтому на время подмены глушим таймер и возвращаем его в конце при любом
+# исходе.
 log "перезагружаю модуль"
+TIMER_WAS=$(systemctl is-active e3372-reconcile.timer 2>/dev/null || echo unknown)
+if [ "$TIMER_WAS" = active ]; then
+    systemctl stop e3372-reconcile.timer >/dev/null 2>&1
+    log "  таймер драйвера приостановлен на время подмены"
+fi
+restore_timer() {
+    [ "$TIMER_WAS" = active ] && systemctl start e3372-reconcile.timer >/dev/null 2>&1
+    return 0
+}
+trap restore_timer EXIT
+
 i=1
-while [ "$i" -le 4 ]; do
+while [ "$i" -le 5 ]; do
     n=0
     for l in /sys/bus/usb/drivers/rndis_host/*:*; do
         [ -e "$l" ] || continue
         echo "$(basename "$l")" > /sys/bus/usb/drivers/rndis_host/unbind 2>/dev/null && n=$((n + 1))
     done
     [ "$n" -gt 0 ] && log "  попытка $i: отвязано интерфейсов $n"
-    sleep 2
-    lsmod | grep -q '^rndis_host' && rmmod rndis_host 2>/dev/null
-    modprobe rndis_host 2>/dev/null
+    sleep 3
+    if lsmod | grep -q '^rndis_host'; then
+        rmmod rndis_host 2>/dev/null || log "  попытка $i: модуль ещё занят, жду"
+    fi
+    lsmod | grep -q '^rndis_host' || modprobe rndis_host 2>/dev/null
     [ "$(cat /sys/module/rndis_host/parameters/rx_urb_size_override 2>/dev/null)" = "$SIZE" ] && break
     i=$((i + 1))
 done
