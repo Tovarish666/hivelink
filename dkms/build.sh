@@ -154,19 +154,25 @@ depmod -a
 # Поэтому: сначала отвязываем все устройства, потом выгружаем, потом грузим
 # и ПРОВЕРЯЕМ, что параметр появился.
 
+# Одной попытки мало: udev успевает привязать устройства обратно раньше, чем
+# отработает rmmod, тот падает, а modprobe для уже загруженного модуля —
+# пустышка. В памяти остаётся старое значение при новом конфиге. Наблюдалось:
+# в modprobe.d 32768, в /sys/module 16384. Поэтому крутим до совпадения.
 log "перезагружаю модуль"
-n=0
-for l in /sys/bus/usb/drivers/rndis_host/*:*; do
-    [ -e "$l" ] || continue
-    echo "$(basename "$l")" > /sys/bus/usb/drivers/rndis_host/unbind 2>/dev/null && n=$((n + 1))
+i=1
+while [ "$i" -le 4 ]; do
+    n=0
+    for l in /sys/bus/usb/drivers/rndis_host/*:*; do
+        [ -e "$l" ] || continue
+        echo "$(basename "$l")" > /sys/bus/usb/drivers/rndis_host/unbind 2>/dev/null && n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] && log "  попытка $i: отвязано интерфейсов $n"
+    sleep 2
+    lsmod | grep -q '^rndis_host' && rmmod rndis_host 2>/dev/null
+    modprobe rndis_host 2>/dev/null
+    [ "$(cat /sys/module/rndis_host/parameters/rx_urb_size_override 2>/dev/null)" = "$SIZE" ] && break
+    i=$((i + 1))
 done
-[ "$n" -gt 0 ] && log "  отвязано интерфейсов: $n"
-sleep 2
-
-if lsmod | grep -q '^rndis_host'; then
-    rmmod rndis_host 2>/dev/null || warn "  rmmod не сработал — модуль всё ещё занят"
-fi
-modprobe rndis_host 2>/dev/null
 
 # Устройства вернутся сами по udev; подтолкнём, чтобы не ждать таймера.
 udevadm trigger --subsystem-match=usb --attr-match=idVendor=12d1 >/dev/null 2>&1 || true
@@ -183,6 +189,12 @@ case "$f" in
     */updates/*) : ;;
     *) warn "  на диске штатный модуль — DKMS не подменил его" ;;
 esac
+
+if [ -n "$p" ] && [ "$p" != "$SIZE" ] && [ "$p" != 0 ]; then
+    warn "  в памяти $p, а в конфиге $SIZE — модуль не перезагрузился за 4 попытки."
+    warn "  Освободи драйвер и повтори, либо перезагрузи хост."
+    exit 1
+fi
 
 if [ -z "$p" ]; then
     warn "  ПАРАМЕТРА НЕТ: в памяти загружен старый модуль, фикс НЕ работает."
