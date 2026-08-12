@@ -143,9 +143,55 @@ options rndis_host rx_urb_size_override=$SIZE
 EOF
 depmod -a
 
+# --------------------------------------------------- перезагрузка модуля ----
+#
+# Файл на диске подменён, но в памяти остаётся СТАРЫЙ модуль: простой rmmod
+# не может выгрузить драйвер, к которому привязаны интерфейсы, и молча падает.
+# Ровно на этом фикс однажды оказался «установлен, но не работает»: modinfo
+# показывал пропатченный файл, а /sys/module/.../rx_urb_size_override
+# отсутствовал, и приём продолжал сыпаться.
+#
+# Поэтому: сначала отвязываем все устройства, потом выгружаем, потом грузим
+# и ПРОВЕРЯЕМ, что параметр появился.
+
+log "перезагружаю модуль"
+n=0
+for l in /sys/bus/usb/drivers/rndis_host/*:*; do
+    [ -e "$l" ] || continue
+    echo "$(basename "$l")" > /sys/bus/usb/drivers/rndis_host/unbind 2>/dev/null && n=$((n + 1))
+done
+[ "$n" -gt 0 ] && log "  отвязано интерфейсов: $n"
+sleep 2
+
+if lsmod | grep -q '^rndis_host'; then
+    rmmod rndis_host 2>/dev/null || warn "  rmmod не сработал — модуль всё ещё занят"
+fi
+modprobe rndis_host 2>/dev/null
+
+# Устройства вернутся сами по udev; подтолкнём, чтобы не ждать таймера.
+udevadm trigger --subsystem-match=usb --attr-match=idVendor=12d1 >/dev/null 2>&1 || true
+
 # ------------------------------------------------------------- проверка -----
 f=$(modinfo rndis_host 2>/dev/null | awk '/^filename/{print $2}')
+p=$(cat /sys/module/rndis_host/parameters/rx_urb_size_override 2>/dev/null)
+
+log "проверка:"
+log "  файл:     ${f:-не найден}"
+log "  параметр: ${p:-ОТСУТСТВУЕТ}"
+
 case "$f" in
-    */updates/*) log "OK — активен исправленный модуль ($f)" ;;
-    *)           warn "загружается штатный модуль ($f). Перезагрузи: rmmod rndis_host && modprobe rndis_host" ;;
+    */updates/*) : ;;
+    *) warn "  на диске штатный модуль — DKMS не подменил его" ;;
 esac
+
+if [ -z "$p" ]; then
+    warn "  ПАРАМЕТРА НЕТ: в памяти загружен старый модуль, фикс НЕ работает."
+    warn "  Освободи драйвер и повтори, либо перезагрузи хост:"
+    warn "     for l in /sys/bus/usb/drivers/rndis_host/*:*; do echo \$(basename \$l) > /sys/bus/usb/drivers/rndis_host/unbind; done"
+    warn "     rmmod rndis_host && modprobe rndis_host"
+    exit 1
+elif [ "$p" = 0 ]; then
+    warn "  параметр 0 — фикс выключен, приём останется ~1.3 Мбит"
+else
+    log "  OK — фикс активен, rx_urb_size = $p"
+fi
