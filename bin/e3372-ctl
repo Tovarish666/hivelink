@@ -80,7 +80,7 @@ case "$cmd" in
             printf 'N=%s up:   ' "$n"
             with_session "$n" /api/dialup/dial \
                 '<?xml version="1.0" encoding="UTF-8"?><request><Action>1</Action></request>'
-            st_del "dial.$n"
+            for k in bad lvl act stk ncf; do st_del "$k.$n"; done     # лестница починки — с начала
         done
         ;;
     reset)
@@ -105,7 +105,9 @@ case "$cmd" in
     forget)
         rm -f "$VAR/confmap" 2>/dev/null
         rm -f "$RUN"/probe.* "$RUN"/cfgtry.* "$RUN"/nodrv.* "$RUN"/zerocd.* \
-              "$RUN"/dhcp.* "$RUN"/dial.* "$RUN"/.msg.* 2>/dev/null
+              "$RUN"/dhcp.* "$RUN"/dial.* "$RUN"/.msg.* \
+              "$RUN"/bad.* "$RUN"/lvl.* "$RUN"/act.* "$RUN"/stk.* "$RUN"/ncf.* "$RUN"/nc.* \
+              "$RUN"/boot.* "$RUN"/api.* "$RUN"/reenum.* 2>/dev/null
         echo "всё выученное и все счётчики очищены"
         ;;
     api)
