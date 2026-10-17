@@ -5,7 +5,7 @@
 # =============================================================================
 # shellcheck shell=bash disable=SC2034
 
-E3372_VERSION="2.0.0"
+E3372_VERSION="2.1.0"
 
 # ---------------------------------------------------------------------------
 # Настройки по умолчанию. Переопределяются в /etc/e3372/e3372.conf
@@ -20,12 +20,22 @@ RULE_PRIO_BASE=1000
 CFG_MAX_TRIES=8                                   # перебор USB-конфигураций
 ZEROCD_MAX_TRIES=3                                # попытки usb_modeswitch до re-enumerate
 NODRV_GRACE=3                                     # циклов ждать привязки драйвера
-DHCP_MAX_TRIES=10
+DHCP_MAX_TRIES=10                                 # подряд; дальше — раз в DHCP_RETRY_EVERY
+DHCP_RETRY_EVERY=300
 HILINK_EVERY=4                                    # раз в сколько циклов дёргать web-API
 HILINK_CONCURRENCY=8
 AUTO_DATASWITCH=1                                 # включать мобильные данные
 AUTO_RECONNECT=1                                  # переподнимать соединение
-RECONNECT_COOLDOWN=180                            # сек между попытками дозвона
+RECONNECT_COOLDOWN=180                            # сек между попытками починки одного модема
+AUTO_HEAL=1                                       # лестница починки (см. heal)
+STUCK_GRACE=180                                   # сек: «коннектит»/«отключается» дольше — завис
+HEAL_REBOOT_AFTER=600                             # сек без связи — перезагрузить модем
+HEAL_REBOOT_EVERY=1800                            # перезагрузка одного модема не чаще
+NETCHECK_EVERY=300                                # сек: у «онлайн» проверять, ходит ли трафик; 0 — нет
+NETCHECK_FAILS=3                                  # неудач подряд — «онлайн, но трафика нет»
+NETCHECK_HOST=1.1.1.1
+API_DEAD_AFTER=600                                # сек: web-API молчит — заново подключить USB
+API_REENUM_EVERY=1800
 USB_AUTOSUSPEND_OFF=1
 DNS_FALLBACK="1.1.1.1 8.8.8.8"
 SKIP_SUBNET_COLLISION=1                           # не трогать модем, чья подсеть = сеть хоста
@@ -260,15 +270,138 @@ net_text() {
 }
 
 # ---------------------------------------------------------------------------
+# Лестница починки. Модем без связи не ждёт человека: чем дольше нет связи,
+# тем сильнее средство (одна попытка на модем не чаще RECONNECT_COOLDOWN):
+#   0. дозвон (Action=1)                           — «отключён», «сбой»
+#   1. отключить и подключить (Action 0 -> 1)      — то же, что e3372-ctl reconnect
+#   2. перерегистрация: данные выкл -> режим сети туда-обратно -> данные вкл
+#   3. перезагрузка модема — без связи дольше HEAL_REBOOT_AFTER,
+#      не чаще HEAL_REBOOT_EVERY на модем
+# «Без связи» — это ещё и: «коннектит»/«отключается» дольше STUCK_GRACE (с 1);
+# нет регистрации при SIM на месте (с 2; сначала модем ищет сеть сам);
+# «онлайн», но трафик с адреса модема не идёт NETCHECK_FAILS раз подряд (с 1).
+# Web-API молчит дольше API_DEAD_AFTER, а адрес есть — USB-устройство заново.
+# Раньше в этих случаях драйвер только писал в журнал и ждал команды руками.
+# ---------------------------------------------------------------------------
+LADDER=("дозвон" "откл -> вкл" "перерегистрация в сети" "перезагрузка модема")
+
+mins() { if [ "$1" -ge 60 ]; then printf '%d мин' $(( $1 / 60 )); else printf '%d с' "$1"; fi; }
+
+# POST со свежей сессией: часть прошивок принимает токен только один раз. 0 — модем ответил OK.
+hl_do() {                         # gw path inner
+    local ses sid tok
+    ses=$(hl_session "$1") || return 1
+    sid=${ses%%|*}; tok=${ses##*|}
+    hl_post "$1" "$sid" "$tok" "$2" "<?xml version=\"1.0\" encoding=\"UTF-8\"?><request>$3</request>" \
+        | tr -d '\r\n' | grep -q '<response>[[:space:]]*OK[[:space:]]*</response>'
+}
+hl_again() { local i; for i in 1 2 3; do hl_do "$@" && return 0; [ "$i" -lt 3 ] && sleep 2; done; return 1; }
+
+# Данные выкл -> режим сети туда-обратно -> данные вкл: модем заново регистрируется
+# у оператора. Режим и диапазоны возвращаются как были; нет net-mode — хватит данных.
+reregister() {                    # n gw
+    local n="$1" gw="$2" ses sid tok m mode band lte tmp
+    if ses=$(hl_session "$gw"); then
+        sid=${ses%%|*}; tok=${ses##*|}
+        m=$(hl_get "$gw" "$sid" "$tok" /api/net/net-mode)
+        mode=$(printf '%s' "$m" | xmlval NetworkMode)
+        band=$(printf '%s' "$m" | xmlval NetworkBand); lte=$(printf '%s' "$m" | xmlval LTEBand)
+    fi
+    band=${band:-3FFFFFFF}; lte=${lte:-7FFFFFFFFFFFFFFF}
+    hl_do "$gw" /api/dialup/mobile-dataswitch '<dataswitch>0</dataswitch>'
+    sleep 2
+    if [ -n "$mode" ]; then
+        tmp=02; [ "$mode" = 02 ] && tmp=03
+        if hl_do "$gw" /api/net/net-mode "<NetworkMode>$tmp</NetworkMode><NetworkBand>$band</NetworkBand><LTEBand>$lte</LTEBand>"; then
+            sleep 2
+            hl_again "$gw" /api/net/net-mode "<NetworkMode>$mode</NetworkMode><NetworkBand>$band</NetworkBand><LTEBand>$lte</LTEBand>" \
+                || log "N=$n: режим сети не вернулся к $mode"
+        fi
+    fi
+    hl_again "$gw" /api/dialup/mobile-dataswitch '<dataswitch>1</dataswitch>' \
+        || log "N=$n: не включилась передача данных"
+    return 0
+}
+
+heal() {                          # n gw why first-level
+    local n="$1" gw="$2" why="$3" first="${4:-0}" ts bad lvl down
+    [ "${AUTO_HEAL:-1}" = 1 ] && [ "${AUTO_RECONNECT:-1}" = 1 ] || return 0
+    ts=$(now)
+    bad=$(st_get "bad.$n" 0); [ "$bad" -gt 0 ] || { bad=$ts; st_set "bad.$n" "$ts"; }
+    [ $(( ts - $(st_get "act.$n" 0) )) -lt "$RECONNECT_COOLDOWN" ] && return 0
+    lvl=$(st_get "lvl.$n" 0); [ "$lvl" -lt "$first" ] && lvl=$first
+    down=$(( ts - bad ))
+    if [ "$lvl" -ge 2 ] && [ "$down" -ge "$HEAL_REBOOT_AFTER" ] \
+       && [ $(( ts - $(st_get "boot.$n" 0) )) -ge "$HEAL_REBOOT_EVERY" ]; then
+        lvl=3
+    fi
+    log "N=$n: $why; без связи $(mins "$down") — ${LADDER[$lvl]}"
+    st_set "act.$n" "$ts"
+    if [ "$lvl" -eq 3 ]; then st_set "lvl.$n" 0; else st_set "lvl.$n" $(( lvl >= 1 ? 2 : 1 )); fi
+    case "$lvl" in
+        0) hl_do "$gw" /api/dialup/dial '<Action>1</Action>' || log "N=$n: дозвон не принят" ;;
+        1) hl_do "$gw" /api/dialup/dial '<Action>0</Action>'
+           sleep 3
+           hl_do "$gw" /api/dialup/dial '<Action>1</Action>' || log "N=$n: откл -> вкл не прошло" ;;
+        2) reregister "$n" "$gw" ;;
+        3) st_set "boot.$n" "$ts"
+           hl_do "$gw" /api/device/control '<Control>1</Control>' || log "N=$n: перезагрузка не принята" ;;
+    esac
+    return 0
+}
+
+healthy() { st_del "bad.$1"; st_del "lvl.$1"; st_del "act.$1"; st_del "stk.$1"; return 0; }
+
+# У «онлайн»: ходит ли трафик. 1 — NETCHECK_FAILS неудач подряд. Проверяем, только если у
+# адреса модема есть свой выход (правило from + default в его таблице), иначе проверка врёт.
+netcheck() {                      # n ip
+    local n="$1" ip="$2" tbl ts fails
+    [ "${NETCHECK_EVERY:-0}" -gt 0 ] 2>/dev/null || return 0
+    tbl=$(ip rule show 2>/dev/null | awk -v s="$ip" '$2 == "from" && ($3 == s || $3 == s "/32") { print $5; exit }')
+    [ -n "$tbl" ] && ip route show table "$tbl" 2>/dev/null | grep -q '^default' || return 0
+    ts=$(now); fails=$(st_get "ncf.$n" 0)
+    [ "$fails" -eq 0 ] && [ $(( ts - $(st_get "nc.$n" 0) )) -lt "$NETCHECK_EVERY" ] && return 0
+    st_set "nc.$n" "$ts"
+    if curl -s -o /dev/null -m 6 --interface "$ip" "http://$NETCHECK_HOST/" 2>/dev/null; then
+        [ "$fails" -gt 0 ] && log "N=$n: трафик снова идёт"
+        st_del "ncf.$n"
+        return 0
+    fi
+    fails=$(( fails + 1 )); st_set "ncf.$n" "$fails"
+    if [ "$fails" -lt "$NETCHECK_FAILS" ]; then
+        log "N=$n: «онлайн», но $NETCHECK_HOST не отвечает ($fails из $NETCHECK_FAILS)"
+        return 0
+    fi
+    return 1
+}
+
+# Web-API молчит, а адрес есть: после API_DEAD_AFTER — USB-устройство заново (не чаще
+# API_REENUM_EVERY). Питание так не снимается, но зависший web-сервер обычно оживает.
+api_dead() {                      # n iface
+    local n="$1" ifn="$2" ts first port
+    [ "${AUTO_HEAL:-1}" = 1 ] || return 0
+    ts=$(now)
+    first=$(st_get "api.$n" 0); [ "$first" -gt 0 ] || { first=$ts; st_set "api.$n" "$ts"; }
+    [ $(( ts - first )) -lt "$API_DEAD_AFTER" ] && return 0
+    [ $(( ts - $(st_get "reenum.$n" 0) )) -lt "$API_REENUM_EVERY" ] && return 0
+    port=$(iface_usb_port "$ifn") || return 0
+    log "N=$n: web-API молчит $(mins $(( ts - first ))) — заново подключаю USB-устройство $port"
+    st_set "reenum.$n" "$ts"; st_set "api.$n" "$ts"
+    usb_reenumerate "/sys/bus/usb/devices/$port"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Обработка одного модема через web-API. Вызывается параллельно через xargs,
 # поэтому не должна ничего писать в общее состояние кроме своих ключей.
 # ---------------------------------------------------------------------------
 modem_worker() {
-    local iface="$1" ip="$2" n gw ses sid tok st cs sw last ts
+    local iface="$1" ip="$2" n gw ses sid tok st cs sw sim ts stk
     n=$(printf '%s' "$ip" | cut -d. -f3)
     gw="$HOST_PREFIX.$n.$GW_OCTET"
 
-    ses=$(hl_session "$gw") || { log_once "N=$n: web-API не отвечает"; return 0; }
+    ses=$(hl_session "$gw") || { log_once "N=$n: web-API не отвечает"; api_dead "$n" "$iface"; return 0; }
+    st_del "api.$n"
     sid=${ses%%|*}; tok=${ses##*|}
 
     # 1. мобильные данные выключены -> включить (это и есть «сеть нашёл,
@@ -283,20 +416,38 @@ modem_worker() {
         fi
     fi
 
-    # 2. данные включены, но соединения нет -> дозвон, с выдержкой
+    # 2. состояние связи -> при беде следующая ступень лестницы (heal)
     st=$(hl_get "$gw" "$sid" "$tok" /api/monitoring/status)
     cs=$(printf '%s' "$st" | xmlval ConnectionStatus)
+    sim=$(printf '%s' "$st" | xmlval SimStatus)
     case "$cs" in
-        901|900|903) st_del "dial.$n"; return 0 ;;
-        '')          log_once "N=$n: статус не читается (сессия/прошивка)"; return 0 ;;
-        90[7]|11[2-5]) log_once "N=$n: нет регистрации в сети (SIM/сигнал/APN)"; return 0 ;;
+        901)
+            st_del "stk.$n"
+            if netcheck "$n" "$ip"; then healthy "$n"
+            else heal "$n" "$gw" "«онлайн», но трафик не идёт ($(st_get "ncf.$n" 0) проверки подряд)" 1; fi
+            return 0 ;;
+        '') log_once "N=$n: статус не читается (сессия/прошивка)"; return 0 ;;
     esac
-    [ "${AUTO_RECONNECT:-1}" = 1 ] || return 0
-    ts=$(now); last=$(st_get "dial.$n" 0)
-    [ $(( ts - last )) -lt "$RECONNECT_COOLDOWN" ] && return 0
-    st_set "dial.$n" "$ts"
-    log "N=$n: ConnectionStatus=$cs ($(conn_text "$cs")) — дозваниваюсь"
-    hl_post "$gw" "$sid" "$tok" /api/dialup/dial \
-        '<?xml version="1.0" encoding="UTF-8"?><request><Action>1</Action></request>' >/dev/null
+    st_del "ncf.$n"
+    case "$cs" in
+        900|903)
+            ts=$(now)
+            stk=$(st_get "stk.$n" 0); [ "$stk" -gt 0 ] || { stk=$ts; st_set "stk.$n" "$ts"; }
+            [ $(( ts - stk )) -ge "$STUCK_GRACE" ] \
+                && heal "$n" "$gw" "«$(conn_text "$cs")» уже $(mins $(( ts - stk )))" 1
+            return 0 ;;
+    esac
+    st_del "stk.$n"
+    case "$cs" in
+        907|11[2-5])
+            if [ -n "$sim" ] && [ "$sim" != 1 ]; then
+                log_once "N=$n: SIM не готова (SimStatus=$sim) — проверь SIM-карту"; return 0
+            fi
+            log_once "N=$n: нет регистрации в сети (сигнал, баланс, APN)"
+            [ "$(st_get "act.$n" 0)" -gt 0 ] || st_set "act.$n" "$(now)"     # сначала модем ищет сеть сам
+            heal "$n" "$gw" "нет регистрации в сети" 2
+            return 0 ;;
+    esac
+    heal "$n" "$gw" "ConnectionStatus=$cs ($(conn_text "$cs"))" 0
     return 0
 }

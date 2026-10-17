@@ -221,19 +221,25 @@ step_usbcfg() {
 #    DHCP. Счётчик попыток не даёт зациклиться на мёртвом модеме.
 # ---------------------------------------------------------------------------
 step_link() {
-    local l ifn drv t
+    local l ifn drv t key
     for l in /sys/class/net/*; do
         [ -e "$l/device" ] || continue
         ifn=${l##*/}
         drv=$(iface_driver "$ifn")
         is_ok_driver "$drv" || continue
         [ "$(cat "$l/operstate" 2>/dev/null)" = down ] && ip link set "$ifn" up 2>/dev/null
+        # Счётчик — на интерфейс с его ifindex: модем перезагрузился и вернулся под тем же
+        # именем — считаем заново. Исчерпали попытки — не бросаем навсегда, а пробуем раз в
+        # DHCP_RETRY_EVERY (раньше такой модем оставался без адреса до ручной команды).
+        key="dhcp.$ifn.$(cat "$l/ifindex" 2>/dev/null)"
         if ip -4 -o addr show dev "$ifn" 2>/dev/null | grep -q 'inet '; then
-            st_del "dhcp.$ifn"; continue
+            st_del "$key"; st_del "$key.t"; continue
         fi
-        t=$(st_get "dhcp.$ifn" 0)
-        [ "$t" -ge "$DHCP_MAX_TRIES" ] && { log_once "$ifn: нет IPv4 после $t попыток"; continue; }
-        st_set "dhcp.$ifn" $(( t + 1 ))
+        t=$(st_get "$key" 0)
+        if [ "$t" -ge "$DHCP_MAX_TRIES" ] && [ $(( $(now) - $(st_get "$key.t" 0) )) -lt "$DHCP_RETRY_EVERY" ]; then
+            log_once "$ifn: нет IPv4 после $t попыток — дальше раз в $(( DHCP_RETRY_EVERY / 60 )) мин"; continue
+        fi
+        st_set "$key" $(( t + 1 )); st_set "$key.t" "$(now)"
         log "$ifn ($drv) без IPv4 — networkctl reconfigure"
         networkctl reconfigure "$ifn" >/dev/null 2>&1
     done
@@ -299,8 +305,9 @@ step_route() {
 }
 
 # ---------------------------------------------------------------------------
-# 6. HiLink web-API: мобильные данные и дозвон. Тяжёлый шаг (сеть, 40 модемов),
-#    поэтому не каждый цикл и параллельно с ограничением по количеству.
+# 6. HiLink web-API: мобильные данные и лестница починки (modem_worker, heal в
+#    common.sh). Тяжёлый шаг (сеть, 40 модемов), поэтому не каждый цикл и
+#    параллельно с ограничением по количеству.
 # ---------------------------------------------------------------------------
 step_hilink() {
     command -v curl >/dev/null 2>&1 || return 0
