@@ -11,10 +11,15 @@ set -uo pipefail
 # shellcheck source=../lib/common.sh
 . /usr/local/lib/e3372/common.sh
 
-# Параллельный воркер web-API вызывает сам себя же с этим флагом.
+# Параллельные воркеры (web-API, Zero-CD) — это сам скрипт с флагом, без блокировки.
 if [ "${1:-}" = "--modem" ]; then
     shift
     modem_worker "${1:-}" "${2:-}"
+    exit 0
+fi
+if [ "${1:-}" = "--zerocd" ]; then
+    shift
+    zerocd_worker "$@"
     exit 0
 fi
 
@@ -55,49 +60,73 @@ step_power() {
 # ---------------------------------------------------------------------------
 # 2. Zero-CD -> рабочий режим.
 #    Устройство пришло как mass storage (12d1:1f01, 1f02, 1f10..1f14, 1440).
-#    Повторяет цикл виндового DataCard_Setup.exe: найти -> послать команду ->
-#    подождать -> повторить -> принудительно пере-enumerate.
+#    usb_modeswitch шлёт HuaweiNewMode в mass-storage интерфейс ТЕКУЩЕЙ
+#    конфигурации (-i). Конфигурацию не меняем: модем в cfg 2 (MBIM — её
+#    выбирает ядро) на запись cfg 1 сам переподключается, ядро снова ставит
+#    cfg 2 — и так по кругу (40 модемов, октябрь 2026). А CD-интерфейс есть и
+#    в cfg 2. Модемы — параллельно: сорок по одному — минуты.
+#    Не переключился за ZEROCD_MAX_TRIES — принудительное пере-enumerate.
 # ---------------------------------------------------------------------------
+zerocd_worker() {                       # port pid bus dev ms tries
+    local port="$1" pid="$2" bus="$3" dev="$4" ms="$5" tries="$6" out
+    out=$(usb_modeswitch -v 12d1 -p "$pid" -b "$bus" -g "$dev" \
+          -c "$MODESWITCH_D/12d1:$pid" -i "$ms" 2>&1)
+    case "$out" in
+        *"successfully sent"*|*"No devices in default mode"*) return 0 ;;   # второе — уже ушёл
+    esac
+    log "$port 12d1:$pid usb_modeswitch не отправил (попытка $(( tries + 1 ))): $(printf '%s\n' "$out" | grep . | tail -1 | cut -c1-120)"
+    return 0
+}
+
 step_zerocd() {
     command -v usb_modeswitch >/dev/null 2>&1 || return 0
-    local d port pid tries cfg bus dev cur tot
+    local d port pid tries bus dev cur tot ms n t jobs=()
+    t=$(now)
     while read -r d; do
         [ -d "$d" ] || continue
         port=$(dev_port "$d"); pid=$(dev_attr "$d" idProduct)
         [ -n "$pid" ] || continue
-        if [ "$(pid_mode "$pid")" != cdrom ]; then st_del "zerocd.$port"; continue; fi
+        if [ "$(pid_mode "$pid")" != cdrom ]; then
+            st_del "zerocd.$port"; st_del "zcfg.$port"; st_del "zerocd_t.$port"; continue
+        fi
+        # Команда ушла — модему нужно 5–10 с, чтобы отключиться и прийти в новом
+        # режиме. Проходы (udev на каждое событие, таймер) чаще: не повторять
+        # раньше ZEROCD_WAIT, иначе за секунды набираются «неудачи» и USB
+        # дёргается посреди переключения.
+        [ $(( t - $(st_get "zerocd_t.$port" 0) )) -lt "$ZEROCD_WAIT" ] && continue
 
-        # Zero-CD, но не на первой конфигурации. У этих устройств вторая
-        # конфигурация несёт MBIM: её забирает cdc_mbim, появляется бесполезный
-        # wwanN, а mass-storage endpoint — единственный адресат сообщения
-        # usb_modeswitch — в ней ОТСУТСТВУЕТ. Переключать бесполезно: проверено
-        # на живом парке, 12 модемов отработали по 49 попыток вхолостую.
-        # Сначала конфигурация 1, переключение — следующим циклом.
-        cur=$(dev_attr "$d" bConfigurationValue)
-        tot=$(dev_attr "$d" bNumConfigurations)
-        case "$tot" in ''|*[!0-9]*) tot=1 ;; esac
-        if [ -n "$cur" ] && [ "$cur" != 1 ] && [ "$tot" -gt 1 ] 2>/dev/null; then
-            log "$port 12d1:$pid Zero-CD в cfg $cur/$tot — usb_modeswitch там бессилен, ставлю cfg 1"
-            set_config "$d" 1
-            st_set "zerocd.$port" 0
+        ms=$(ms_iface "$d")
+        if [ -z "$ms" ]; then
+            # В этой конфигурации CD-части нет — только тогда пробуем cfg 1, и не
+            # каждый проход: модем, который на смену конфигурации переподключается,
+            # иначе крутится вечно.
+            cur=$(dev_attr "$d" bConfigurationValue); tot=$(dev_attr "$d" bNumConfigurations)
+            case "$tot" in ''|*[!0-9]*) tot=1 ;; esac
+            n=$(st_get "zcfg.$port" 0); st_set "zcfg.$port" $(( n + 1 ))
+            if [ -n "$cur" ] && [ "$cur" != 1 ] && [ "$tot" -gt 1 ] && [ $(( n % 4 )) -eq 0 ]; then
+                log "$port 12d1:$pid Zero-CD без CD-интерфейса в cfg $cur/$tot — ставлю cfg 1"
+                set_config "$d" 1
+            fi
             continue
         fi
 
         tries=$(st_get "zerocd.$port" 0)
+        st_set "zerocd_t.$port" "$t"
         if [ "$tries" -ge "$ZEROCD_MAX_TRIES" ]; then
             log "$port 12d1:$pid не переключается за $tries попыток — пере-enumerate"
             usb_reenumerate "$d"
             st_set "zerocd.$port" 0
             continue
         fi
-        cfg="/etc/usb_modeswitch.d/12d1:$pid"
-        [ -f "$cfg" ] || { log_once "нет конфига $cfg"; continue; }
+        [ -f "$MODESWITCH_D/12d1:$pid" ] || { log_once "нет конфига $MODESWITCH_D/12d1:$pid"; continue; }
         bus=$(dev_attr "$d" busnum); dev=$(dev_attr "$d" devnum)
         [ -n "$bus" ] && [ -n "$dev" ] || continue
-        log "$port 12d1:$pid в CD-ROM — usb_modeswitch (попытка $(( tries + 1 )))"
-        usb_modeswitch -v 12d1 -p "$pid" -b "$bus" -g "$dev" -c "$cfg" >/dev/null 2>&1
+        jobs+=("$port $pid $bus $dev $ms $tries")
         st_set "zerocd.$port" $(( tries + 1 ))
     done < <(usb_devs)
+    [ "${#jobs[@]}" -gt 0 ] || return 0
+    log "Zero-CD: переключаю ${#jobs[@]} (usb_modeswitch, по $ZEROCD_PARALLEL разом)"
+    printf '%s\n' "${jobs[@]}" | xargs -r -P "$ZEROCD_PARALLEL" -L 1 "$0" --zerocd 2>/dev/null
     return 0
 }
 

@@ -50,6 +50,27 @@ if command -v lsinitramfs >/dev/null 2>&1; then
         echo "ВНИМАНИЕ: rndis_host лежит в initramfs — после перезагрузки загрузится он, не наш."
 fi
 
+sec "модемы — только рабочий режим"
+# Всё ниже на сорока модемах мешало переключению Zero-CD и сети (октябрь 2026).
+if [ -r "$MODPROBE_CONF" ]; then echo "modprobe.d: $MODPROBE_CONF есть"; else echo "modprobe.d: $MODPROBE_CONF НЕТ — запустите install.sh"; fi
+if [ -d /sys/module/cdc_mbim ]; then echo "cdc_mbim: ЗАГРУЖЕН — MBIM забирает модемы в cfg 2"; else echo "cdc_mbim: не загружен"; fi
+n=0
+for i in /sys/bus/usb/drivers/usb-storage/*:*; do
+    [ -e "$i" ] || continue
+    [ "$(cat "$(dirname "$(readlink -f "$i")")/idVendor" 2>/dev/null)" = 12d1 ] && n=$(( n + 1 ))
+done
+if [ "$n" -gt 0 ]; then echo "usb-storage: держит $n CD/SD модемов"; else echo "usb-storage: модемы не держит"; fi
+printf 'usb-storage quirks: %s\n' "$(cat /sys/module/usb_storage/parameters/quirks 2>/dev/null || echo '-')"
+if systemctl is-active --quiet ModemManager.service 2>/dev/null; then echo "ModemManager: РАБОТАЕТ — хватает модемы"; else echo "ModemManager: не работает"; fi
+mac=$(primary_mac)
+if [ -z "$mac" ]; then
+    echo "eth0: правила имени по MAC нет — не наше дело"
+elif [ "$(cat /sys/class/net/eth0/address 2>/dev/null)" = "$mac" ]; then
+    echo "eth0: основная карта $mac"
+else
+    echo "eth0: НЕ у основной карты $mac (e3372-ctl eth0)"
+fi
+
 sec "USB-устройства Huawei"
 printf '%-11s %-6s %-6s %-7s %-14s %s\n' ПОРТ PID REV CFG РЕЖИМ ДРАЙВЕРЫ/IFACE
 while read -r d; do
@@ -70,7 +91,7 @@ sec "выученные конфигурации (/var/lib/e3372/confmap)"
 cat "$VAR/confmap" 2>/dev/null || echo "(пусто — ещё не изучено)"
 
 sec "счётчики попыток (/run/e3372)"
-for f in "$RUN"/cfgtry.* "$RUN"/zerocd.* "$RUN"/nodrv.* "$RUN"/dhcp.* "$RUN"/probe.*; do
+for f in "$RUN"/cfgtry.* "$RUN"/zerocd.* "$RUN"/zcfg.* "$RUN"/nodrv.* "$RUN"/dhcp.* "$RUN"/probe.*; do
     [ -e "$f" ] || continue
     printf '%-40s %s\n' "${f##*/}" "$(cat "$f" 2>/dev/null)"
 done
@@ -93,6 +114,7 @@ ip rule show 2>/dev/null | grep "$HOST_PREFIX\." || echo "(нет)"
 sec "systemd"
 systemctl --no-pager --full status e3372-reconcile.timer 2>/dev/null | head -12
 systemctl --no-pager --full status e3372-reconcile.service 2>/dev/null | head -12
+systemctl is-enabled e3372-eth0.service 2>/dev/null | sed 's/^/e3372-eth0.service: /'
 
 sec "journal (последние 80 строк драйвера)"
 journalctl -t e3372 -n 80 --no-pager 2>/dev/null || echo "(журнал недоступен)"

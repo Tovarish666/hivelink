@@ -22,7 +22,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Tovarish666/hivelink/main/in
 
 | Развилка | Как выглядит поломка | Что делает драйвер |
 |---|---|---|
-| **1. Zero-CD** | `12d1:1f01` — устройство отдаётся как CD-ROM | конфигурация 1, затем `usb_modeswitch` с `HuaweiNewMode`, при отказе — пере-enumeration |
+| **1. Zero-CD** | `12d1:1f01` — устройство отдаётся как CD-ROM | `usb_modeswitch` с `HuaweiNewMode` в CD-интерфейс текущей конфигурации, по 8 модемов разом; при отказе — пере-enumeration |
 | **2. USB-конфигурация** | `wwanN`, NOARP, DOWN, адреса нет | перебор `bConfigurationValue` до конфигурации, дающей `rndis_host`/`cdc_ether` |
 | **3. Передача данных** | интерфейс с адресом, web-API отвечает, наружу трафик не идёт | сессия HiLink → `dataswitch=1`, при `ConnectionStatus != 901` — дозвон |
 | **4. Скорость приёма** | всё работает, но download ~1.3 Мбит при нормальном upload | DKMS-патч `rndis_host`: настоящий `rx_urb_size` вместо зашитых 2048 |
@@ -74,7 +74,13 @@ HiLink-прошивка отдаёт **несколько USB-конфигура
 |---|---|
 | Ядро выбрало NCM-конфигурацию → `wwanN` без DHCP | перебор `bConfigurationValue`, запоминание удачной по модели |
 | Запись `bConfigurationValue` отбита с EBUSY | сначала `-1` (расконфигурировать), потом целевое значение |
-| Zero-CD оказался на конфигурации с MBIM | там нет mass-storage endpoint, `usb_modeswitch` бессилен — сначала ставится конфигурация 1 |
+| Zero-CD оказался на конфигурации с MBIM (её выбирает ядро) | конфигурацию не трогаем: модем на запись cfg 1 сам переподключается, ядро снова ставит cfg 2 — по кругу. CD-интерфейс есть и в cfg 2: `usb_modeswitch -i <номер>` шлёт команду туда. Только если CD-интерфейса в конфигурации нет — cfg 1, и не чаще раза в 4 прохода |
+| Сорок Zero-CD по одному — минуты | `usb_modeswitch` параллельно, `ZEROCD_PARALLEL` (8) разом |
+| Повтор, пока модем ещё переподключается, считается неудачей и дёргает USB | для одного модема — не раньше `ZEROCD_WAIT` (25 с) |
+| `cdc_mbim` забирает модемы: десятки `wwanN`, за ними ModemManager | `blacklist cdc_mbim` + `install cdc_mbim /bin/true` (`/etc/modprobe.d/e3372-modems.conf`), сейчас — выгрузка |
+| usb-storage берёт CD и microSD модемов: десятки «дисков» с ошибками чтения забивают udev и шину | `options usb-storage quirks=12d1:PID:i` (в 127 символов параметра, чужие записи не выталкиваются), сейчас — отвязка |
+| ModemManager хватает модемы | выключается (uninstall.sh вернёт) + `ID_MM_DEVICE_IGNORE` на всё от 12d1 |
+| modprobe.d и `.link` лежат и в initramfs | после правки — `update-initramfs -u` |
 | Модем в Zero-CD не реагирует на `usb_modeswitch` | после `ZEROCD_MAX_TRIES` — `authorized` 0→1, полное пере-enumeration |
 | Устройство ещё не привязало драйвер, а мы уже дёргаем конфигурацию | `NODRV_GRACE` циклов ожидания, только потом переход к следующей |
 | Конфигурация вообще без сетевой функции (serial-only) | помечается `none`, перебор идёт дальше, а не встаёт |
@@ -106,6 +112,7 @@ HiLink-прошивка отдаёт **несколько USB-конфигура
 | `networkd-dispatcher` не срабатывает: `operstate` остаётся `UNKNOWN`, событие `routable` не приходит | зависимость выброшена, маршруты раскладываются самим драйвером безусловно |
 | Интерфейс поднялся, DHCP не доехал | `networkctl reconfigure`: `DHCP_MAX_TRIES` подряд, дальше раз в `DHCP_RETRY_EVERY` — не бросаем навсегда; модем вернулся под тем же именем — счёт заново |
 | Загрузка хоста ждёт сорок интерфейсов | `RequiredForOnline=no` |
+| Модем занял `eth0` основной карты (ВМ с netplan: карта по MAC зовётся eth0, а в initramfs `.link` netplan нет) — машина без сети | свой `10-e3372-eth0.link` по MAC карты (попадает в initramfs), udev сразу переименовывает модем с `eth0` в `eth64+`, `e3372-eth0.service` при загрузке — последняя страховка (`e3372-ctl eth0`) |
 
 ### HiLink web-API
 
@@ -177,6 +184,7 @@ e3372-ctl reconnect 115   # пересоединить модем N=115
 e3372-ctl reset 115       # пере-enumerate USB-устройства модема
 e3372-ctl recfg --all     # забыть выученные конфигурации и перебрать заново
 e3372-ctl api 115 /api/device/information
+e3372-ctl eth0            # вернуть eth0 основной карте, если его занял модем
 journalctl -t e3372 -f    # что делает драйвер
 ```
 
@@ -215,8 +223,11 @@ N    IFACE            DRIVER       CFG   CONN            DATASW NET   EXIT-IP
 /usr/local/bin/e3372-{status,ctl,doctor}      утилиты
 /etc/e3372/e3372.conf                         настройки
 /etc/systemd/system/e3372-reconcile.{service,timer}
+/etc/systemd/system/e3372-eth0.service        eth0 — основной карте (если карта зовётся eth0)
 /etc/systemd/network/25-e3372.network         DHCP на модемных интерфейсах
-/etc/udev/rules.d/70-e3372.rules              триггер драйвера + питание шины
+/etc/systemd/network/10-e3372-eth0.link       имя eth0 по MAC основной карты (только ВМ с netplan)
+/etc/modprobe.d/e3372-modems.conf             без MBIM, usb-storage не берёт модемы
+/etc/udev/rules.d/70-e3372.rules              триггер драйвера, питание шины, ModemManager, eth0
 /etc/udev/rules.d/71-e3372-ports.rules        стабильные имена AT-портов
 /etc/sysctl.d/99-e3372.conf                   rp_filter, ARP, neigh
 /etc/usb_modeswitch.d/12d1:1f0*, 12d1:1f1*    Zero-CD
