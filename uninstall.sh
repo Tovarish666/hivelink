@@ -23,9 +23,20 @@ while read -r addr; do
     ip route flush table "$tbl" 2>/dev/null || true
 done < <(ip rule show 2>/dev/null | sed -n 's/.*from \(192\.168\.[0-9]*\.100\)\/32.*/\1/p' | sort -u)
 
+echo "[e3372] возвращаю модемам MBIM и usb-storage, ModemManager — как был…"
+systemctl disable e3372-eth0.service >/dev/null 2>&1 || true
+INITRD=0
+for f in /etc/modprobe.d/e3372-modems.conf /etc/systemd/network/10-e3372-eth0.link; do
+    [ -e "$f" ] && { rm -f "$f"; INITRD=1; }
+done
+if [ -e /var/lib/e3372/mm_disabled ]; then
+    systemctl enable --now ModemManager.service >/dev/null 2>&1 || true
+fi
+
 echo "[e3372] удаляю файлы…"
 rm -f /etc/systemd/system/e3372-reconcile.service \
       /etc/systemd/system/e3372-reconcile.timer \
+      /etc/systemd/system/e3372-eth0.service \
       /etc/systemd/network/25-e3372.network \
       /etc/udev/rules.d/70-e3372.rules \
       /etc/udev/rules.d/71-e3372-ports.rules \
@@ -53,6 +64,10 @@ done
 
 systemctl daemon-reload 2>/dev/null || true
 udevadm control --reload 2>/dev/null || true
+if [ "$INITRD" = 1 ] && command -v update-initramfs >/dev/null 2>&1; then
+    echo "[e3372] обновляю initramfs…"
+    update-initramfs -u >/dev/null 2>&1 || true
+fi
 systemctl restart systemd-networkd 2>/dev/null || true
 sysctl -q -w net.ipv4.conf.all.rp_filter=1 2>/dev/null || true
 

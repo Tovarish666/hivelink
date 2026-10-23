@@ -1,0 +1,14 @@
+[Unit]
+Description=e3372-driver: eth0 — основной сетевой карте машины, а не USB-модему
+DefaultDependencies=no
+After=local-fs.target systemd-udev-trigger.service
+Before=network-pre.target systemd-networkd.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/e3372-ctl eth0
+TimeoutStartSec=40
+
+[Install]
+WantedBy=multi-user.target

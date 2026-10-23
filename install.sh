@@ -37,10 +37,10 @@ SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd) || SELF_D
 SRC=""
 if [ -n "$SELF_DIR" ] && [ -r "$SELF_DIR/lib/common.sh" ]; then
     SRC="$SELF_DIR"
-    log "1/8 ставлю из локального дерева: $SRC"
+    log "1/9 ставлю из локального дерева: $SRC"
 else
     command -v curl >/dev/null 2>&1 || die "нужен curl (apt install curl)"
-    log "1/8 качаю репозиторий с GitHub…"
+    log "1/9 качаю репозиторий с GitHub…"
     WORK=$(mktemp -d) || die "нет /tmp"
     trap 'rm -rf "$WORK"' EXIT
     ok=0
@@ -69,7 +69,7 @@ fi
 #    легко пролистать. Теперь: ничего не глушится, apt не спрашиваем о том, что
 #    ставить (его симуляция и возвращала пустой список), в конце жёсткая проверка.
 # ---------------------------------------------------------------------------
-log "2/8 зависимости…"
+log "2/9 зависимости…"
 DEBDIR="$SRC/deb"
 pkg_installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'ok installed'; }
 
@@ -128,7 +128,10 @@ modprobe -a cdc_ether rndis_host cdc_ncm huawei_cdc_ncm >/dev/null 2>&1 || true
 # ---------------------------------------------------------------------------
 # 3. Файлы
 # ---------------------------------------------------------------------------
-log "3/8 раскладываю файлы…"
+log "3/9 раскладываю файлы…"
+# правило udev меняется — его копия в initramfs тоже должна (шаг 5)
+INITRD=0
+cmp -s "$SRC/udev/70-e3372.rules" /etc/udev/rules.d/70-e3372.rules 2>/dev/null || INITRD=1
 install -d "$PREFIX_LIB" "$PREFIX_SBIN" "$PREFIX_BIN" "$CONFDIR" \
            /etc/usb_modeswitch.d /etc/systemd/network /etc/udev/rules.d /etc/sysctl.d \
            /var/lib/e3372
@@ -140,6 +143,7 @@ install -m 0755 "$SRC/bin/e3372-doctor"               "$PREFIX_BIN/e3372-doctor"
 install -m 0644 "$SRC/systemd/25-e3372.network"       /etc/systemd/network/25-e3372.network
 install -m 0644 "$SRC/systemd/e3372-reconcile.service" /etc/systemd/system/e3372-reconcile.service
 install -m 0644 "$SRC/systemd/e3372-reconcile.timer"   /etc/systemd/system/e3372-reconcile.timer
+install -m 0644 "$SRC/systemd/e3372-eth0.service"     /etc/systemd/system/e3372-eth0.service
 install -m 0644 "$SRC/udev/70-e3372.rules"            /etc/udev/rules.d/70-e3372.rules
 install -m 0644 "$SRC/udev/71-e3372-ports.rules"      /etc/udev/rules.d/71-e3372-ports.rules
 install -m 0644 "$SRC/sysctl/99-e3372.conf"           /etc/sysctl.d/99-e3372.conf
@@ -166,7 +170,7 @@ done
 # ---------------------------------------------------------------------------
 # 4. usb_modeswitch: Zero-CD PID по FcSwitch.inf
 # ---------------------------------------------------------------------------
-log "4/8 usb_modeswitch: Zero-CD PID (вкл. ветку Vodafone K5150/K5160)…"
+log "4/9 usb_modeswitch: Zero-CD PID (вкл. ветку Vodafone K5150/K5160)…"
 # 14fe/1505/155a/1c0b ставили прошлые версии — это switcher-serial PID
 # (ew_hwusbdev.inf), а не mass storage. Конфиг для них бесполезен, убираем.
 for stale in 14fe 1505 155a 1c0b; do
@@ -219,13 +223,59 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5. sysctl
+# 5. Модемы — только рабочий режим. На сорока модемах переключению мешали:
+#    MBIM (ядро само ставит Zero-CD в cfg 2 — десятки wwanN), usb-storage
+#    (десятки «дисков» с ошибками чтения), ModemManager (хватает модемы) и
+#    модем, занявший eth0 основной карты. modprobe.d и .link лежат и в
+#    initramfs — после правки его пересобираем.
 # ---------------------------------------------------------------------------
-log "5/8 sysctl…"
+log "5/9 модемы — только рабочий режим (MBIM, usb-storage, ModemManager, eth0)…"
+e3() { bash -c ". '$PREFIX_LIB/common.sh' && $*"; }
+MODPROBE=/etc/modprobe.d/e3372-modems.conf
+ETH0_LINK=/etc/systemd/network/10-e3372-eth0.link
+want=$(e3 modprobe_text)
+if [ "$(cat "$MODPROBE" 2>/dev/null)" != "$want" ]; then
+    printf '%s\n' "$want" > "$MODPROBE"; INITRD=1
+    log "    cdc_mbim запрещён, usb-storage не берёт модемы Huawei"
+fi
+e3 modems_apply_now | sed 's/^/    /'
+
+mm=$(systemctl is-enabled ModemManager.service 2>/dev/null)
+case "$mm" in
+    enabled*)
+        systemctl disable --now ModemManager.service >/dev/null 2>&1
+        touch /var/lib/e3372/mm_disabled
+        log "    ModemManager выключен (хватал модемы) — uninstall.sh вернёт" ;;
+    *)
+        systemctl is-active --quiet ModemManager.service 2>/dev/null \
+            && systemctl stop ModemManager.service >/dev/null 2>&1 ;;
+esac
+
+ETH0=0
+mac=$(e3 primary_mac)
+if [ -n "$mac" ]; then
+    want=$(e3 "eth0_link_text $mac")
+    if [ "$(cat "$ETH0_LINK" 2>/dev/null)" != "$want" ]; then
+        printf '%s\n' "$want" > "$ETH0_LINK"; INITRD=1
+    fi
+    ETH0=1
+    log "    eth0 закреплён за основной картой $mac"
+fi
+
+if [ "$INITRD" = 1 ] && command -v update-initramfs >/dev/null 2>&1; then
+    log "    обновляю initramfs (там своя копия modprobe.d, .link и правил udev)…"
+    update-initramfs -u >/dev/null 2>&1 \
+        || warn "    update-initramfs с ошибкой — до его пересборки правила работают только после загрузки"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. sysctl
+# ---------------------------------------------------------------------------
+log "6/9 sysctl…"
 sysctl -q --system >/dev/null 2>&1 || warn "sysctl --system с предупреждениями"
 
 # ---------------------------------------------------------------------------
-# 6. Фикс скорости приёма (баг rndis_host).
+# 7. Фикс скорости приёма (баг rndis_host).
 #
 #    Драйвер сообщает модему max_transfer_size = 2048, тот режет батчи под это
 #    число, и RNDIS-сообщения перестают помещаться в один URB. Собирать
@@ -237,7 +287,7 @@ sysctl -q --system >/dev/null 2>&1 || warn "sysctl --system с предупре�
 #    необязательный: если сборка не прошла, парк работает — просто медленно
 #    на приём. Отключается через SKIP_RNDIS_FIX=1 или RX_URB_SIZE=0 в конфиге.
 # ---------------------------------------------------------------------------
-log "6/8 фикс скорости приёма (DKMS)…"
+log "7/9 фикс скорости приёма (DKMS)…"
 # Инструменты раскладываем ВСЕГДА, даже когда сборка пропущена: иначе
 # передумать и поставить фикс позже будет нечем.
 if [ -r "$SRC/dkms/build.sh" ]; then
@@ -264,10 +314,10 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Сервисы. Снимок resolv.conf до перезапуска networkd — если модемы его
+# 8. Сервисы. Снимок resolv.conf до перезапуска networkd — если модемы его
 #    обнулят, хост ослепнет, а мы это заметим только по симптомам.
 # ---------------------------------------------------------------------------
-log "7/8 сервисы…"
+log "8/9 сервисы…"
 RESOLV_BAK=$(mktemp); cp -a /etc/resolv.conf "$RESOLV_BAK" 2>/dev/null || true
 
 udevadm control --reload >/dev/null 2>&1 || true
@@ -277,6 +327,12 @@ systemctl enable --now systemd-networkd >/dev/null 2>&1 || true
 systemctl restart systemd-networkd >/dev/null 2>&1 || true
 systemctl enable --now e3372-reconcile.timer >/dev/null 2>&1 \
     || die "не удалось включить e3372-reconcile.timer"
+if [ "$ETH0" = 1 ]; then
+    systemctl enable e3372-eth0.service >/dev/null 2>&1 || warn "не удалось включить e3372-eth0.service"
+    /usr/local/bin/e3372-ctl eth0 | sed 's/^/    /'
+else
+    systemctl disable e3372-eth0.service >/dev/null 2>&1 || true
+fi
 
 sleep 2
 if [ ! -L /etc/resolv.conf ] && ! grep -q '^nameserver' /etc/resolv.conf 2>/dev/null; then
@@ -287,9 +343,9 @@ fi
 rm -f "$RESOLV_BAK"
 
 # ---------------------------------------------------------------------------
-# 7. Первый проход
+# 9. Первый проход
 # ---------------------------------------------------------------------------
-log "8/8 первый проход драйвера…"
+log "9/9 первый проход драйвера…"
 "$PREFIX_SBIN/e3372-reconcile" || true
 
 echo

@@ -5,7 +5,7 @@
 # =============================================================================
 # shellcheck shell=bash disable=SC2034
 
-E3372_VERSION="2.1.0"
+E3372_VERSION="2.2.0"
 
 # ---------------------------------------------------------------------------
 # Настройки по умолчанию. Переопределяются в /etc/e3372/e3372.conf
@@ -19,6 +19,8 @@ GW_OCTET=1                                        # адрес самого мо
 RULE_PRIO_BASE=1000
 CFG_MAX_TRIES=8                                   # перебор USB-конфигураций
 ZEROCD_MAX_TRIES=3                                # попытки usb_modeswitch до re-enumerate
+ZEROCD_PARALLEL=8                                 # сколько Zero-CD переключать разом
+ZEROCD_WAIT=25                                    # сек: повтор для одного модема не раньше
 NODRV_GRACE=3                                     # циклов ждать привязки драйвера
 DHCP_MAX_TRIES=10                                 # подряд; дальше — раз в DHCP_RETRY_EVERY
 DHCP_RETRY_EVERY=300
@@ -116,6 +118,13 @@ pid_mode() {
 
 # PID «установочного» (Zero-CD) режима — для usb_modeswitch-конфигов.
 ZEROCD_PIDS="1f01 1f02 1f10 1f11 1f12 1f13 1f14 1440"
+MODESWITCH_D=/etc/usb_modeswitch.d
+# usb-storage не берёт эти PID (флаг i): CD и microSD модема не нужны, а десятки «дисков»
+# с ошибками чтения забивают udev и шину сбросами. Сначала самые частые: строка параметра
+# модуля — не длиннее 127 символов.
+STORAGE_IGNORE="1f01 14dc 14db 1f02 1f10 1f11 1f12 1f13 1f14 1440"
+MODPROBE_CONF=/etc/modprobe.d/e3372-modems.conf
+ETH0_LINK=/etc/systemd/network/10-e3372-eth0.link
 
 # ---------------------------------------------------------------------------
 # USB
@@ -134,6 +143,19 @@ usb_devs() {
 
 dev_port() { printf '%s' "${1##*/}"; }
 dev_attr() { cat "$1/$2" 2>/dev/null; return 0; }
+
+# Номер mass-storage интерфейса (CD модема) в ТЕКУЩЕЙ конфигурации, пусто — нет такого.
+# У Zero-CD Huawei он есть и в cfg 1, и в MBIM-конфигурации 2 (там третьим интерфейсом).
+ms_iface() {
+    local i
+    for i in "$1":*; do
+        [ -r "$i/bInterfaceClass" ] || continue
+        [ "$(cat "$i/bInterfaceClass" 2>/dev/null)" = 08 ] || continue
+        printf '%d' "0x$(cat "$i/bInterfaceNumber" 2>/dev/null || echo 0)"
+        return 0
+    done
+    return 0
+}
 
 # Драйверы, привязанные к интерфейсам устройства.
 dev_drivers() {
@@ -449,5 +471,107 @@ modem_worker() {
             return 0 ;;
     esac
     heal "$n" "$gw" "ConnectionStatus=$cs ($(conn_text "$cs"))" 0
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Модемы — только рабочий режим: MBIM, usb-storage, ModemManager, имя eth0.
+# Всё это на сорока модемах мешало переключению (SpbVL-1, октябрь 2026).
+# ---------------------------------------------------------------------------
+# quirks для usb-storage: чужие записи как были, наши «не брать» — сколько влезет в 127.
+storage_quirks() {
+    local out="" q p
+    for q in $(printf '%s' "${1:-}" | tr ',' ' '); do
+        case "${q,,}" in 12d1:*) continue ;; esac
+        out="${out:+$out,}$q"
+    done
+    for p in $STORAGE_IGNORE; do
+        q="12d1:$p:i"
+        [ ${#out} -gt 0 ] && q=",$q"
+        [ $(( ${#out} + ${#q} )) -le 127 ] && out="$out$q"
+    done
+    printf '%s' "$out"
+}
+
+modprobe_text() {
+    cat <<EOT
+# e3372-driver: настоящие модемы Huawei — только рабочий режим (HiLink: rndis_host/cdc_ether).
+# MBIM не нужен: ядро само ставит Zero-CD конфигурацию 2 с MBIM — десятки wwanN, за ними
+# ModemManager, а переключению это мешает.
+blacklist cdc_mbim
+install cdc_mbim /bin/true
+# CD и microSD модемов не нужны: Zero-CD переключается через usbfs (usb_modeswitch).
+# i — не брать устройство.
+options usb-storage quirks=$(storage_quirks)
+EOT
+}
+
+# То же, что даст modprobe.d после перезагрузки, — сейчас. Печатает, что сделано.
+modems_apply_now() {
+    local qp=/sys/module/usb_storage/parameters/quirks want i n=0
+    if [ -w "$qp" ]; then
+        want=$(storage_quirks "$(cat "$qp" 2>/dev/null)")
+        if [ "$(cat "$qp" 2>/dev/null)" != "$want" ]; then
+            printf '%s' "$want" > "$qp" 2>/dev/null && echo "usb-storage: модемы Huawei не берёт"
+        fi
+        for i in /sys/bus/usb/drivers/usb-storage/*:*; do
+            [ -e "$i" ] || continue
+            [ "$(cat "$(dirname "$(readlink -f "$i")")/idVendor" 2>/dev/null)" = 12d1 ] || continue
+            printf '%s' "${i##*/}" > /sys/bus/usb/drivers/usb-storage/unbind 2>/dev/null && n=$(( n + 1 ))
+        done
+        [ "$n" -gt 0 ] && echo "usb-storage отпустил CD/SD модемов: $n"
+    fi
+    if [ -d /sys/module/cdc_mbim ]; then
+        if modprobe -r cdc_mbim 2>/dev/null; then echo "cdc_mbim выгружен"; else echo "cdc_mbim не выгрузился (занят)"; fi
+    fi
+    return 0
+}
+
+# MAC основной сетевой карты, которой .link велит имя eth0 (netplan ВМ из cloud-init).
+# Нет такого правила (хост Proxmox: vmbr0, enpXsY) — пусто: eth0 не наше дело.
+primary_mac() {
+    local f
+    for f in /run/systemd/network/*.link /etc/systemd/network/*.link; do
+        [ -r "$f" ] || continue
+        [ "$f" = "$ETH0_LINK" ] && continue
+        grep -qE '^Name=eth0[[:space:]]*$' "$f" 2>/dev/null || continue
+        sed -nE 's/^(Permanent)?MACAddress=([0-9A-Fa-f:]{17})[[:space:]]*$/\2/p' "$f" | head -1 | tr 'A-F' 'a-f'
+        return 0
+    done
+    return 0
+}
+
+eth0_link_text() {
+    printf '# e3372-driver: основной сетевой карте — eth0 с первой секунды загрузки (и в initramfs),\n'
+    printf '# чтобы имя не успел занять USB-модем. MAC — из .link netplan (Name=eth0).\n'
+    printf '[Match]\nPermanentMACAddress=%s\n\n[Link]\nName=eth0\n' "$1"
+}
+
+free_eth() { local i=64; while [ -e "/sys/class/net/eth$i" ]; do i=$(( i + 1 )); done; printf 'eth%d' "$i"; }
+
+# Загрузка: eth0 занял модем (успел раньше основной карты) — модем на свободное ethN,
+# основной карте — eth0. Зовёт e3372-eth0.service до запуска сети.
+fix_eth0() {
+    local mac nic="" n i to
+    mac=$(primary_mac)
+    [ -n "$mac" ] || { echo "нет правила имени eth0 по MAC — не наше дело"; return 0; }
+    for i in $(seq 1 40); do
+        for n in /sys/class/net/*; do
+            [ "$(cat "$n/address" 2>/dev/null)" = "$mac" ] && { nic=${n##*/}; break; }
+        done
+        [ -n "$nic" ] && break
+        sleep 0.5
+    done
+    [ -n "$nic" ] || { echo "сетевой карты $mac нет"; return 0; }
+    [ "$nic" = eth0 ] && { echo "eth0 на месте"; return 0; }
+    if [ -e /sys/class/net/eth0 ]; then
+        [ "$(cat "$(readlink -f /sys/class/net/eth0/device)/../idVendor" 2>/dev/null)" = 12d1 ] \
+            || { echo "eth0 занят не модемом — не трогаю"; return 0; }
+        to=$(free_eth)
+        ip link set eth0 down; ip link set eth0 name "$to"
+        log "eth0 был у модема — он теперь $to"
+    fi
+    ip link set "$nic" down; ip link set "$nic" name eth0; ip link set eth0 up
+    log "основная сетевая карта $nic ($mac) — снова eth0"
     return 0
 }
