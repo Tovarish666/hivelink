@@ -6,7 +6,8 @@ mkdir -p "$T/run" "$T/var" "$T/ms.d" "$T/rnet" "$T/enet" "$T/sys"
 sed -e "s#^RUN=/run/e3372#RUN=$T/run#" -e "s#^VAR=/var/lib/e3372#VAR=$T/var#" \
     -e "s#/etc/e3372/e3372.conf#$T/none.conf#g" -e "s#^MODESWITCH_D=.*#MODESWITCH_D=$T/ms.d#" \
     -e "s#/run/systemd/network/#$T/rnet/#g" -e "s#/etc/systemd/network/\*#$T/enet/*#g" \
-    -e "s#^ETH0_LINK=.*#ETH0_LINK=$T/enet/10-e3372-eth0.link#" "$D/lib/common.sh" > "$T/common.sh"
+    -e "s#^ETH0_LINK=.*#ETH0_LINK=$T/enet/10-e3372-eth0.link#" -e "s#^ZEROCD_DELAY=.*#ZEROCD_DELAY=0#" \
+    "$D/lib/common.sh" > "$T/common.sh"
 . "$T/common.sh"
 # шаг Zero-CD из драйвера; воркеры xargs — та же функция в дочернем bash
 sed -n '/^zerocd_worker()/,/^}/p; /^step_zerocd()/,/^}/p' "$D/sbin/e3372-reconcile" \
@@ -16,7 +17,7 @@ echo 1 > "$T/ms.d/12d1:1f01"
 BASE=1800000000
 now() { echo $(( BASE + $(cat "$T/now") )); }
 logger() { printf '%s\n' "$*" >> "$T/log"; }
-sleep() { :; }
+sleep() { printf '%s\n' "$1" >> "$T/sleeps"; }
 usb_modeswitch() { printf '%s\n' "$*" >> "$T/ms.log"; [ -f "$T/msfail" ] && echo "Error: no response" || echo "Message successfully sent"; }
 usb_reenumerate() { printf '%s\n' "${1##*/}" >> "$T/reenum"; }
 export -f zerocd_worker usb_modeswitch log logger
@@ -66,7 +67,8 @@ rm -rf "$T/sys" "$T/run"/*; mkdir -p "$T/sys"
 for i in 1 2 3 4 5 6 7 8 9 10 11 12; do dev "3-1.$i" 1f01 2/2 02; done
 dev 3-2.1 14db 1/2
 pass 0
-check "двенадцать Zero-CD — двенадцать команд (по 8 разом)" "$(calls)" "12"
+check "двенадцать Zero-CD — двенадцать команд" "$(calls)" "12"
+check "не все сразу: по 2, между партиями пауза 3 с (5 пауз)" "$(grep -c '^3$' "$T/sleeps")" "5"
 check "каждому — своё устройство" "$(sed 's/.*-g \([0-9]*\).*/\1/' "$T/ms.log" | sort -n | tr '\n' ' ')" "1 2 3 4 5 6 7 8 9 10 11 12 "
 check "HiLink-модем не трогаем" "$(grep -c -- '-p 14db' "$T/ms.log")" "0"
 check "в журнале — сколько переключаю" "$(grep -c 'Zero-CD: переключаю 12' "$T/log")" "1"
@@ -76,6 +78,15 @@ check "CD-интерфейс в hex (0a = 10)" "$(sed 's/.*-i //' "$T/ms.log")" 
 check "не отправил — в журнал с ответом" "$(grep -c 'не отправил (попытка 1): Error: no response' "$T/log")" "1"
 echo 14db > "$T/sys/3-1.9/idProduct"; pass 200
 check "переключился — счётчики чистятся" "$(ls "$T/run" | grep -c '3-1.9')" "0"
+
+rm -rf "$T/sys" "$T/run"/*; mkdir -p "$T/sys"
+ZEROCD_DELAY=10
+dev 3-1.7 1f01 1/2 02
+pass 0; pass 5
+check "только появился — первые 10 с не трогаем (модем грузится)" "$(calls)" "0"
+pass 11
+check "через 10 с — переключаем" "$(calls)" "1"
+ZEROCD_DELAY=0
 
 q=$(storage_quirks "0bc2:2322:u,12d1:1f01:u")
 check "quirks: чужие на месте, наши «i», старые 12d1 заменены" "${q%%,*} $(echo "$q" | tr ',' '\n' | grep -c '^12d1:.*:i$') $(echo "$q" | grep -c '12d1:1f01:u')" "0bc2:2322:u 9 0"

@@ -17,7 +17,11 @@
 
 ACTION!="add", GOTO="hw_ports_end"
 SUBSYSTEM!="tty", GOTO="hw_ports_end"
-ATTRS{idVendor}!="12d1", GOTO="hw_ports_end"
+# Не «ATTRS{idVendor}!="12d1", GOTO=…»: ATTRS перебирает всех родителей, у хаба выше idVendor
+# не 12d1 — условие верно всегда, и правило уходило в конец, ничего не сделав.
+ATTRS{idVendor}=="12d1", GOTO="hw_ports_go"
+GOTO="hw_ports_end"
+LABEL="hw_ports_go"
 
 IMPORT{builtin}="path_id"
 

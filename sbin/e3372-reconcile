@@ -87,8 +87,13 @@ step_zerocd() {
         port=$(dev_port "$d"); pid=$(dev_attr "$d" idProduct)
         [ -n "$pid" ] || continue
         if [ "$(pid_mode "$pid")" != cdrom ]; then
-            st_del "zerocd.$port"; st_del "zcfg.$port"; st_del "zerocd_t.$port"; continue
+            st_del "zerocd.$port"; st_del "zcfg.$port"; st_del "zerocd_t.$port"; st_del "zerocd_seen.$port"; continue
         fi
+        # Только что появился (включили хаб) — модем грузится: первые ZEROCD_DELAY сек не трогаем.
+        # Команда посреди загрузки — лишний риск: K5160 после двух команд подряд оставались без
+        # радиочасти (24.10.2026).
+        [ -f "$RUN/zerocd_seen.$port" ] || st_set "zerocd_seen.$port" "$t"
+        [ $(( t - $(st_get "zerocd_seen.$port" "$t") )) -lt "$ZEROCD_DELAY" ] && continue
         # Команда ушла — модему нужно 5–10 с, чтобы отключиться и прийти в новом
         # режиме. Проходы (udev на каждое событие, таймер) чаще: не повторять
         # раньше ZEROCD_WAIT, иначе за секунды набираются «неудачи» и USB
@@ -125,8 +130,12 @@ step_zerocd() {
         st_set "zerocd.$port" $(( tries + 1 ))
     done < <(usb_devs)
     [ "${#jobs[@]}" -gt 0 ] || return 0
-    log "Zero-CD: переключаю ${#jobs[@]} (usb_modeswitch, по $ZEROCD_PARALLEL разом)"
-    printf '%s\n' "${jobs[@]}" | xargs -r -P "$ZEROCD_PARALLEL" -L 1 "$0" --zerocd 2>/dev/null
+    log "Zero-CD: переключаю ${#jobs[@]} (по $ZEROCD_PARALLEL, пауза $ZEROCD_GAP с)"
+    local i
+    for (( i = 0; i < ${#jobs[@]}; i += ZEROCD_PARALLEL )); do      # не все сразу
+        [ "$i" -gt 0 ] && sleep "$ZEROCD_GAP"
+        printf '%s\n' "${jobs[@]:i:ZEROCD_PARALLEL}" | xargs -r -P "$ZEROCD_PARALLEL" -L 1 "$0" --zerocd 2>/dev/null
+    done
     return 0
 }
 
